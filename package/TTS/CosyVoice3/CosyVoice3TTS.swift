@@ -34,8 +34,14 @@ actor CosyVoice3TTS {
   /// Maximum character count for a single chunk
   private static let maxChunkCharacters = 300
 
-  /// Token ID for <|endofprompt|> special token (used in instruct mode)
+  /// Token ID for <|endofprompt|> special token
   private static let endOfPromptTokenId: Int = 151_646
+
+  /// CosyVoice3 requires a system prompt prefix in all text inputs.
+  /// The format varies by mode (see upstream example.py).
+  private static let systemPrefix = "You are a helpful assistant.<|endofprompt|>"
+  private static let instructPrefix = "You are a helpful assistant. "
+  private static let endOfPromptMarker = "<|endofprompt|>"
 
   /// CosyVoice3-specific special tokens for speech control
   static let specialTokens: [String] = [
@@ -371,10 +377,12 @@ actor CosyVoice3TTS {
     let speakerEmb = speakerEncoder(audio16k)
 
     // Tokenize reference text if provided
+    // CosyVoice3 requires the format: "You are a helpful assistant.<|endofprompt|>ref text"
     var promptText: MLXArray?
     var promptTextLen: MLXArray?
     if let text = refText?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
-      let tokens = encode(text: text, addSpecialTokens: false)
+      let formattedText = text.hasPrefix(Self.systemPrefix) ? text : Self.systemPrefix + text
+      let tokens = encode(text: formattedText, addSpecialTokens: false)
       promptText = MLXArray(tokens.map { Int32($0) }).reshaped(1, -1)
       promptTextLen = MLXArray([Int32(tokens.count)])
     }
@@ -438,16 +446,20 @@ actor CosyVoice3TTS {
 
   /// Generate audio from text using cross-lingual mode (no reference transcription)
   func generateCrossLingual(
-    text _: String,
-    textTokens: [Int],
+    text: String,
+    textTokens _: [Int],
     conditionals: CosyVoice3Conditionals,
     sampling: Int = 25,
     nTimesteps: Int = 10
   ) throws -> TTSGenerationResult {
     let startTime = CFAbsoluteTimeGetCurrent()
 
-    let textArray = MLXArray(textTokens.map { Int32($0) }).reshaped(1, -1)
-    let textLen = MLXArray([Int32(textTokens.count)])
+    // CosyVoice3 cross-lingual mode requires the format:
+    // "You are a helpful assistant.<|endofprompt|>text"
+    let formattedText = text.hasPrefix(Self.systemPrefix) ? text : Self.systemPrefix + text
+    let crossLingualTokens = encode(text: formattedText, addSpecialTokens: false)
+    let textArray = MLXArray(crossLingualTokens.map { Int32($0) }).reshaped(1, -1)
+    let textLen = MLXArray([Int32(crossLingualTokens.count)])
 
     let audio = try model.synthesizeCrossLingual(
       text: textArray,
@@ -517,9 +529,16 @@ actor CosyVoice3TTS {
     let textArray = MLXArray(textTokens.map { Int32($0) }).reshaped(1, -1)
     let textLen = MLXArray([Int32(textTokens.count)])
 
-    // Tokenize instruct text and manually append <|endofprompt|> token
-    var instructTokens = encode(text: instructText, addSpecialTokens: false)
-    instructTokens.append(Self.endOfPromptTokenId)
+    // CosyVoice3 instruct mode requires the format:
+    // "You are a helpful assistant. instruction<|endofprompt|>"
+    var formattedInstruct = instructText
+    if !formattedInstruct.hasPrefix(Self.instructPrefix) {
+      formattedInstruct = Self.instructPrefix + formattedInstruct
+    }
+    if !formattedInstruct.hasSuffix(Self.endOfPromptMarker) {
+      formattedInstruct += Self.endOfPromptMarker
+    }
+    let instructTokens = encode(text: formattedInstruct, addSpecialTokens: false)
     let instructArray = MLXArray(instructTokens.map { Int32($0) }).reshaped(1, -1)
     let instructLen = MLXArray([Int32(instructTokens.count)])
 
@@ -609,14 +628,18 @@ actor CosyVoice3TTS {
   ///   - chunkSize: Number of tokens per audio chunk (default: 25, must match training)
   /// - Returns: AsyncThrowingStream of audio samples as [Float]
   func generateCrossLingualStreaming(
-    textTokens: [Int],
+    text: String,
     conditionals: CosyVoice3Conditionals,
     sampling: Int = 25,
     nTimesteps: Int = 10,
     chunkSize: Int = 25
   ) -> AsyncThrowingStream<[Float], Error> {
-    let textArray = MLXArray(textTokens.map { Int32($0) }).reshaped(1, -1)
-    let textLen = MLXArray([Int32(textTokens.count)])
+    // CosyVoice3 cross-lingual mode requires the format:
+    // "You are a helpful assistant.<|endofprompt|>text"
+    let formattedText = text.hasPrefix(Self.systemPrefix) ? text : Self.systemPrefix + text
+    let crossLingualTokens = encode(text: formattedText, addSpecialTokens: false)
+    let textArray = MLXArray(crossLingualTokens.map { Int32($0) }).reshaped(1, -1)
+    let textLen = MLXArray([Int32(crossLingualTokens.count)])
 
     // Cross-lingual mode: empty prompt text
     let emptyPromptText = MLXArray.zeros([1, 0], dtype: .int32)

@@ -893,7 +893,7 @@ public final class CosyVoice3Engine: TTSEngine {
         )
       } else {
         await cosyVoice3TTS.generateCrossLingualStreaming(
-          textTokens: textTokens,
+          text: trimmedText,
           conditionals: speaker.conditionals,
           sampling: currentSampling,
           nTimesteps: currentNTimesteps,
