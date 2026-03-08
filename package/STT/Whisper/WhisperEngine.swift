@@ -22,13 +22,16 @@ public final class WhisperEngine: STTEngine {
 
   // MARK: - Whisper-Specific Properties
 
-  /// Model size
+  /// Model size (nil when loaded from a custom repo ID)
   public let modelSize: WhisperModelSize
 
   /// Quantization level
   public let quantization: WhisperQuantization
 
   // MARK: - Private Properties
+
+  /// Custom HuggingFace repo ID, overrides the repo derived from modelSize + quantization.
+  @ObservationIgnored private let customRepoId: String?
 
   @ObservationIgnored private var whisperSTT: WhisperSTT?
 
@@ -37,7 +40,24 @@ public final class WhisperEngine: STTEngine {
   public init(modelSize: WhisperModelSize = .base, quantization: WhisperQuantization = .q4) {
     self.modelSize = modelSize
     self.quantization = quantization
+    self.customRepoId = nil
     Log.tts.debug("WhisperEngine initialized with model: \(modelSize.rawValue), quantization: \(quantization.rawValue)")
+  }
+
+  /// Initialize with an explicit HuggingFace repository ID.
+  ///
+  /// Use this when the repository does not follow the standard
+  /// `mlx-community/whisper-<size>-<quantization>` naming (e.g. `mlx-community/whisper-large-v3-turbo`).
+  ///
+  /// - Parameters:
+  ///   - repoId: Full HuggingFace repository identifier
+  ///   - quantization: Quantization level, used only for the MLX quantize pass when weights
+  ///     already contain `.scales` keys. Default is fp16 (no quantization pass).
+  public init(repoId: String, quantization: WhisperQuantization = .fp16) {
+    self.modelSize = .largeTurbo
+    self.quantization = quantization
+    self.customRepoId = repoId
+    Log.tts.debug("WhisperEngine initialized with custom repo: \(repoId), quantization: \(quantization.rawValue)")
   }
 
   // MARK: - STTEngine Protocol Methods
@@ -52,11 +72,19 @@ public final class WhisperEngine: STTEngine {
     let quantization = quantization
     Log.model.info("Loading Whisper \(modelSize.rawValue) (\(quantization.rawValue)) model...")
 
-    whisperSTT = try await WhisperSTT.load(
-      modelSize: modelSize,
-      quantization: quantization,
-      progressHandler: progressHandler ?? { _ in }
-    )
+    if let repoId = customRepoId {
+      whisperSTT = try await WhisperSTT.load(
+        repoId: repoId,
+        quantization: quantization,
+        progressHandler: progressHandler ?? { _ in }
+      )
+    } else {
+      whisperSTT = try await WhisperSTT.load(
+        modelSize: modelSize,
+        quantization: quantization,
+        progressHandler: progressHandler ?? { _ in }
+      )
+    }
 
     isLoaded = true
     Log.model.info("Whisper model loaded successfully")

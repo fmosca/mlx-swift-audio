@@ -134,7 +134,7 @@ class WhisperModel: Module {
     alignmentHeads = heads
   }
 
-  /// Load Whisper model from Hugging Face Hub
+  /// Load Whisper model from Hugging Face Hub by model size enum.
   ///
   /// - Parameters:
   ///   - modelSize: Model size (tiny, base, small, medium, large, largeTurbo)
@@ -146,25 +146,42 @@ class WhisperModel: Module {
     quantization: WhisperQuantization = .q4,
     progressHandler: @escaping @Sendable (Progress) -> Void = { _ in }
   ) async throws -> WhisperModel {
-    // Validate model is available (has safetensors weights)
     guard modelSize.isAvailable else {
       throw STTError.modelUnavailable(
         "Model '\(modelSize.rawValue)' requires .npz format which MLX Swift doesn't support. Available models: tiny, base, large-v3-turbo"
       )
     }
+    return try await load(
+      repoId: modelSize.repoId(quantization: quantization),
+      quantization: quantization,
+      progressHandler: progressHandler
+    )
+  }
 
-    let repoId = modelSize.repoId(quantization: quantization)
+  /// Load Whisper model from an arbitrary Hugging Face repository ID.
+  ///
+  /// Use this when the standard `WhisperModelSize` naming convention does not match the
+  /// desired repository (e.g. `mlx-community/whisper-large-v3-turbo` rather than the
+  /// suffixed variants produced by `WhisperModelSize.repoId(quantization:)`).
+  ///
+  /// - Parameters:
+  ///   - repoId: Full HuggingFace repository identifier (e.g. "mlx-community/whisper-large-v3-turbo")
+  ///   - quantization: Quantization level, used only to configure the MLX quantize pass when
+  ///     the weights already contain `.scales` keys. Default is fp16 (no quantization pass).
+  ///   - progressHandler: Optional callback for download progress
+  /// - Returns: Initialized WhisperModel with loaded weights
+  static func load(
+    repoId: String,
+    quantization: WhisperQuantization = .fp16,
+    progressHandler: @escaping @Sendable (Progress) -> Void = { _ in }
+  ) async throws -> WhisperModel {
     Log.model.info("Loading Whisper from \(repoId)...")
 
-    // Download model files from Hugging Face
-    // All mlx-community Whisper models use:
-    // - model.safetensors: Model weights
-    // - config.json: Model configuration
-    // - multilingual.tiktoken or gpt2.tiktoken: Tokenizer vocabulary
     let modelDirectory = try await HubConfiguration.shared.snapshot(
       from: repoId,
       matching: [
         "model.safetensors",
+        "weights.safetensors",
         "config.json",
         "multilingual.tiktoken",
         "gpt2.tiktoken",
@@ -172,21 +189,25 @@ class WhisperModel: Module {
       progressHandler: progressHandler
     )
 
-    // Load config to get model dimensions
     let configURL = modelDirectory.appending(path: "config.json")
     let dims = try ModelDimensions.load(from: configURL)
 
-    // Load weights from model.safetensors
-    let modelSafetensors = modelDirectory.appending(path: "model.safetensors")
-    guard FileManager.default.fileExists(atPath: modelSafetensors.path) else {
-      throw STTError.modelUnavailable("model.safetensors not found in \(repoId)")
+    let candidateNames = ["model.safetensors", "weights.safetensors"]
+    guard
+      let weightsName = candidateNames.first(where: {
+        FileManager.default.fileExists(
+          atPath: modelDirectory.appending(path: $0).path)
+      })
+    else {
+      throw STTError.modelUnavailable(
+        "No safetensors weights found in \(repoId) (tried: \(candidateNames.joined(separator: ", ")))"
+      )
     }
+    let modelSafetensors = modelDirectory.appending(path: weightsName)
     let weights = try MLX.loadArrays(url: modelSafetensors)
 
-    // Initialize model
     let model = WhisperModel(dims: dims)
 
-    // Apply quantization if weights are quantized and quantization level specifies bits
     let isQuantized = weights.keys.contains { $0.contains(".scales") }
     if isQuantized, let bits = quantization.bits {
       Log.model.info("Detected quantized Whisper model weights (\(bits)-bit)")
@@ -195,20 +216,15 @@ class WhisperModel: Module {
       }
     }
 
-    // Load weights into model
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.noUnusedKeys])
 
-    // Set to eval mode for inference
     model.train(false)
-
-    // Evaluate model to ensure weights are loaded
     eval(model)
 
-    // Store model directory for tokenizer to find vocab files
     model.modelDirectory = modelDirectory
 
-    Log.model.info("Whisper \(modelSize.rawValue) model loaded successfully")
+    Log.model.info("Whisper model loaded from \(repoId)")
 
     return model
   }

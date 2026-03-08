@@ -85,6 +85,24 @@ public enum STT {
     WhisperEngine(modelSize: model, quantization: quantization)
   }
 
+  /// Whisper: multilingual speech recognition loaded from an explicit HuggingFace repository.
+  ///
+  /// Use this when the target repository does not follow the standard
+  /// `mlx-community/whisper-<size>-<quantization>` naming convention
+  /// (e.g. `mlx-community/whisper-large-v3-turbo`).
+  ///
+  /// - Parameters:
+  ///   - repoId: Full HuggingFace repository identifier
+  ///   - quantization: Quantization level, used only for the MLX quantize pass when the weights
+  ///     already contain `.scales` keys. Default is fp16 (no quantization pass).
+  /// - Returns: Configured WhisperEngine instance
+  public static func whisper(
+    repoId: String,
+    quantization: WhisperQuantization = .fp16
+  ) -> WhisperEngine {
+    WhisperEngine(repoId: repoId, quantization: quantization)
+  }
+
   /// Fun-ASR: LLM-based multilingual speech recognition
   ///
   /// Combines SenseVoice encoder with Qwen3 decoder for high-quality

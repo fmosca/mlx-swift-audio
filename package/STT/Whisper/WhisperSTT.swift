@@ -23,7 +23,7 @@ actor WhisperSTT {
     self.tokenizer = tokenizer
   }
 
-  /// Load WhisperSTT from Hugging Face Hub
+  /// Load WhisperSTT from Hugging Face Hub by model size enum.
   ///
   /// - Parameters:
   ///   - modelSize: Model size to load
@@ -35,12 +35,36 @@ actor WhisperSTT {
     quantization: WhisperQuantization = .q4,
     progressHandler: @escaping @Sendable (Progress) -> Void = { _ in }
   ) async throws -> WhisperSTT {
-    // Load model first (the slow operation with progress)
     let model = try await WhisperModel.load(
       modelSize: modelSize,
       quantization: quantization,
       progressHandler: progressHandler
     )
+    return try await finishLoading(model: model)
+  }
+
+  /// Load WhisperSTT from an arbitrary Hugging Face repository ID.
+  ///
+  /// - Parameters:
+  ///   - repoId: Full HuggingFace repository identifier (e.g. "mlx-community/whisper-large-v3-turbo")
+  ///   - quantization: Quantization level, used only for the MLX quantize pass when weights
+  ///     contain `.scales` keys. Default is fp16 (no quantization pass).
+  ///   - progressHandler: Optional callback for download/load progress
+  /// - Returns: Initialized WhisperSTT instance
+  static func load(
+    repoId: String,
+    quantization: WhisperQuantization = .fp16,
+    progressHandler: @escaping @Sendable (Progress) -> Void = { _ in }
+  ) async throws -> WhisperSTT {
+    let model = try await WhisperModel.load(
+      repoId: repoId,
+      quantization: quantization,
+      progressHandler: progressHandler
+    )
+    return try await finishLoading(model: model)
+  }
+
+  private static func finishLoading(model: sending WhisperModel) async throws -> WhisperSTT {
 
     // Then load tokenizer (fast operation) with correct vocabulary for model type
     // Pass model directory so tokenizer can find vocab files bundled with the model
