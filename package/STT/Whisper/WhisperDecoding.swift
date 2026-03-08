@@ -104,9 +104,20 @@ class GreedyDecoder {
     var tokens: [Int] = []
 
     if !options.prompt.isEmpty {
-      // Add <|startofprev|> followed by prompt tokens (previous segment's output)
+      // Add <|startofprev|> followed by prompt tokens (previous segment's output).
+      // Truncate to n_ctx // 2 - 1 tokens, matching Python:
+      //   tokens = [sot_prev] + prompt_tokens[-(n_ctx // 2 - 1):] + sot_sequence
+      // Without this cap the prompt grows unboundedly; once its length exceeds
+      // maxTokens the decode loop generates 0 new tokens, producing empty results
+      // for every subsequent 30-second window while seek still advances — silently
+      // dropping the second half of any long recording.
+      let maxPromptLen = (options.maxTokens / 2) - 1
+      let truncatedPrompt =
+        options.prompt.count > maxPromptLen
+        ? Array(options.prompt.suffix(maxPromptLen))
+        : options.prompt
       tokens.append(tokenizer.sotPrev)
-      tokens.append(contentsOf: options.prompt)
+      tokens.append(contentsOf: truncatedPrompt)
     }
 
     // Track SOT position for no-speech probability extraction (matches Python's sot_index)
@@ -126,11 +137,27 @@ class GreedyDecoder {
     let initialTokenCount = tokens.count
     let maxGenerateTokens = options.maxTokens - initialTokenCount
 
+    // Pre-compute constant arrays used in every iteration of the decode loop.
+    // Building these inside the loop (the previous approach) allocates ~207 KB
+    // of CPU memory per token step — ~1.2 GB for a typical 34-minute meeting.
+    let vocabSizeForMask: Int = {
+      // Encode a dummy token to get the vocab size from the model
+      // We'll capture the actual vocabSize from the first logits call instead
+      // Use a sentinel; it will be replaced after the first forward pass.
+      0
+    }()
+    _ = vocabSizeForMask  // suppress unused warning; real masks built after first pass
+
     // Autoregressive decoding
     var kvCache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]? = nil
     var sumLogProb: Float = 0.0
     var tokenCount = 0
     var noSpeechProb: Float = 0.0
+
+    // Masks pre-computed after the first forward pass (need vocabSize from logits)
+    var cachedIndices: MLXArray? = nil
+    var cachedBaseMask: MLXArray? = nil          // without SuppressBlank (iterations > 0)
+    var cachedBaseMaskFirst: MLXArray? = nil     // with SuppressBlank (iteration 0)
 
     for iteration in 0 ..< maxGenerateTokens {
       // Convert tokens to MLXArray
@@ -179,42 +206,38 @@ class GreedyDecoder {
       let numGenerated = tokens.count - initialTokenCount
 
       // =============================================================================
-      // STEP 1: Build base suppression mask (SuppressBlank + SuppressTokens)
-      // Uses MLX operations for efficiency instead of Swift loops
+      // STEP 1: Base suppression mask (SuppressBlank + SuppressTokens)
+      // Computed once on the first iteration and cached; rebuilding a 207 KB Float
+      // array + MLXArray on every token step is the dominant CPU overhead.
       // =============================================================================
+      if cachedIndices == nil {
+        // Build the constant parts once
+        cachedIndices = MLXArray(Int32(0) ..< Int32(vocabSize))
 
-      // Create indices array for vectorized comparisons
-      let indices = MLXArray(Int32(0) ..< Int32(vocabSize))
+        var baseIds = tokenizer.nonSpeechTokens()
+        baseIds.append(contentsOf: [
+          tokenizer.transcribe, tokenizer.translate,
+          tokenizer.sot, tokenizer.sotPrev,
+          tokenizer.sotLm, tokenizer.noSpeech,
+        ])
+        var maskValues = [Float](repeating: 0.0, count: vocabSize)
+        for id in baseIds where id < vocabSize { maskValues[id] = -Float.infinity }
+        cachedBaseMask = MLXArray(maskValues)
 
-      // SuppressTokens: create mask for specific token IDs (small list, loop is fine)
-      var suppressTokenIds = tokenizer.nonSpeechTokens()
-      suppressTokenIds.append(contentsOf: [
-        tokenizer.transcribe,
-        tokenizer.translate,
-        tokenizer.sot,
-        tokenizer.sotPrev,
-        tokenizer.sotLm,
-        tokenizer.noSpeech,
-      ])
-
-      // SuppressBlank: add blank tokens and EOT on first iteration only
-      if iteration == 0 {
+        // SuppressBlank variant: also suppress space/EOT on the very first generated token
+        var firstMaskValues = maskValues
         if let blankTokens = try? tokenizer.encode(" ") {
-          suppressTokenIds.append(contentsOf: blankTokens)
+          for id in blankTokens where id < vocabSize { firstMaskValues[id] = -Float.infinity }
         }
-        suppressTokenIds.append(tokenizer.eot)
+        firstMaskValues[tokenizer.eot] = -Float.infinity
+        cachedBaseMaskFirst = MLXArray(firstMaskValues)
       }
 
-      // Build base mask efficiently: create Swift array, set values, convert once
-      var baseMaskValues = [Float](repeating: 0.0, count: vocabSize)
-      for tokenId in suppressTokenIds where tokenId < vocabSize {
-        baseMaskValues[tokenId] = -Float.infinity
-      }
-      let baseMask = MLXArray(baseMaskValues)
+      let indices = cachedIndices!
+      let baseMask = iteration == 0 ? cachedBaseMaskFirst! : cachedBaseMask!
 
       // =============================================================================
       // STEP 2: Build timestamp rules mask (ApplyTimestampRules internal mask)
-      // Uses vectorized MLX operations for range-based suppressions
       // =============================================================================
       var timestampMask = MLXArray.zeros([vocabSize])
 
