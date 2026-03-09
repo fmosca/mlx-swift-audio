@@ -60,6 +60,14 @@ class WhisperModel: Module {
     encoder(mel)
   }
 
+  /// Compiled encoder: fuses Conv1d, GELU, self-attention and layer norm into
+  /// an optimised kernel sequence. Fixed input shape [1, nFrames, nMels] allows
+  /// the default (shape-sensitive) compile() to trace once and reuse.
+  lazy var compiledEncode: (MLXArray) -> MLXArray = {
+    let enc = self.encoder
+    return compile { (mel: MLXArray) -> MLXArray in enc(mel) }
+  }()
+
   /// Decode tokens with audio features
   ///
   /// - Parameters:

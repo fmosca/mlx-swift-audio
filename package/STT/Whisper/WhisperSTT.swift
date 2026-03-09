@@ -225,7 +225,7 @@ actor WhisperSTT {
       var result: DecodingResult!
 
       // Encode once per segment (expensive); reuse across temperature fallbacks
-      let audioFeatures = model.encode(batchedMel)
+      let audioFeatures = model.compiledEncode(batchedMel)
       eval(audioFeatures)
 
       for currentTemperature in temperatureFallbackSequence {
@@ -695,7 +695,7 @@ actor WhisperSTT {
     }
 
     // Encode audio
-    let audioFeatures = model.encode(melBatched)
+    let audioFeatures = model.compiledEncode(melBatched)
 
     // Create SOT token
     let sotToken = MLXArray([Int32(tokenizer.sot)]).expandedDimensions(axis: 0)
