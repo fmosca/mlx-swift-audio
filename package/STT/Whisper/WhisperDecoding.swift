@@ -32,13 +32,18 @@ struct DecodingOptions {
   /// These are prepended to the SOT sequence
   let prompt: [Int]
 
+  /// Prevents the model from repeating any n-gram of this size.
+  /// 0 disables the check. Mirrors faster-whisper's no_repeat_ngram_size.
+  let noRepeatNgramSize: Int
+
   init(
     task: TranscriptionTask = .transcribe,
     language: String? = nil,
     temperature: Float = 0.0,
     maxTokens: Int = 448,
     timestamps: TimestampGranularity = .segment,
-    prompt: [Int] = []
+    prompt: [Int] = [],
+    noRepeatNgramSize: Int = 0
   ) {
     self.task = task
     self.language = language
@@ -46,6 +51,7 @@ struct DecodingOptions {
     self.maxTokens = maxTokens
     self.timestamps = timestamps
     self.prompt = prompt
+    self.noRepeatNgramSize = noRepeatNgramSize
   }
 
   static let `default` = DecodingOptions()
@@ -456,4 +462,291 @@ func computeCompressionRatio(_ text: String) -> Float {
   guard compressedSize > 0 else { return 1.0 }
 
   return Float(sourceSize) / Float(compressedSize)
+}
+
+/// Returns the set of token IDs that would complete a repeated n-gram.
+///
+/// Scans `tokens` (the full sequence for one beam, including SOT prefix) for all
+/// occurrences of the last (n-1) tokens and collects the token that followed each
+/// occurrence.  If any of those tokens appear next, a repeat n-gram would form.
+///
+/// - Parameters:
+///   - tokens: Full token sequence (SOT prefix + generated tokens so far)
+///   - initialTokenCount: Number of SOT/prompt prefix tokens (generated region starts here)
+///   - n: N-gram size (must be >= 2)
+/// - Returns: Set of banned token IDs (may be empty)
+func bannedNgramTokens(tokens: [Int], initialTokenCount: Int, n: Int) -> Set<Int> {
+  guard n >= 2 else { return [] }
+  // Convert to Array for 0-based indexing — ArraySlice preserves the source
+  // array's indices which would make the loop subscripts wrong.
+  let generated = Array(tokens[initialTokenCount...])
+  guard generated.count >= n - 1 else { return [] }
+  let suffix = Array(generated.suffix(n - 1))
+  var banned = Set<Int>()
+  let scanEnd = generated.count - (n - 1)
+  if scanEnd <= 0 { return [] }
+  for i in 0 ..< scanEnd {
+    if Array(generated[i ..< i + (n - 1)]) == suffix {
+      banned.insert(generated[i + (n - 1)])
+    }
+  }
+  return banned
+}
+
+// MARK: - Batched Greedy Decoder
+
+/// Decodes B audio segments in parallel, amortising the weight-read cost across the batch.
+///
+/// Constraints:
+/// - `conditionOnPreviousText` must be `false` (no per-segment prompt) so that every
+///   sequence in the batch shares an identical SOT prefix and the KV cache stays in sync.
+/// - Temperature fallback is not performed; the caller is responsible for quality filtering.
+class BatchedGreedyDecoder {
+  let model: WhisperModel
+  let tokenizer: WhisperTokenizer
+
+  // Shared mask caches (same model/tokenizer → identical for all sequences)
+  private var _cachedIndices: MLXArray?
+  private var _cachedBaseMask: MLXArray?
+  private var _cachedBaseMaskFirst: MLXArray?
+
+  init(model: WhisperModel, tokenizer: WhisperTokenizer) {
+    self.model = model
+    self.tokenizer = tokenizer
+  }
+
+  private func ensureMasksCached(vocabSize: Int) {
+    guard _cachedIndices == nil else { return }
+    _cachedIndices = MLXArray.arange(vocabSize)
+
+    var baseIds = tokenizer.nonSpeechTokens()
+    baseIds.append(contentsOf: [
+      tokenizer.transcribe, tokenizer.translate,
+      tokenizer.sot, tokenizer.sotPrev,
+      tokenizer.sotLm, tokenizer.noSpeech,
+    ])
+    var maskValues = [Float](repeating: 0.0, count: vocabSize)
+    for id in baseIds where id < vocabSize { maskValues[id] = -Float.infinity }
+    _cachedBaseMask = MLXArray(maskValues)
+
+    var firstMaskValues = maskValues
+    if let blankTokens = try? tokenizer.encode(" ") {
+      for id in blankTokens where id < vocabSize { firstMaskValues[id] = -Float.infinity }
+    }
+    firstMaskValues[tokenizer.eot] = -Float.infinity
+    _cachedBaseMaskFirst = MLXArray(firstMaskValues)
+  }
+
+  /// Decode a batch of audio segments in parallel.
+  ///
+  /// - Parameters:
+  ///   - audioFeaturesStack: Stacked encoder outputs [B, n_audio_ctx, n_audio_state]
+  ///   - options: Decoding options applied identically to every sequence
+  /// - Returns: One `DecodingResult` per sequence (same order as the input batch)
+  func decodeBatch(audioFeaturesStack: MLXArray, options: DecodingOptions) -> [DecodingResult] {
+    let batchSize = audioFeaturesStack.shape[0]
+
+    // Build the initial SOT token sequence, mirroring GreedyDecoder.decode().
+    // When a prompt is provided, all B sequences in the batch share it — an
+    // approximation of conditionOnPreviousText that preserves parallelism.
+    var sotTokens: [Int] = []
+    if !options.prompt.isEmpty {
+      let maxPromptLen = (options.maxTokens / 2) - 1
+      let truncatedPrompt =
+        options.prompt.count > maxPromptLen
+        ? Array(options.prompt.suffix(maxPromptLen))
+        : options.prompt
+      sotTokens.append(tokenizer.sotPrev)
+      sotTokens.append(contentsOf: truncatedPrompt)
+    }
+
+    // sotIndex: the position of the first language/task token within sotTokens.
+    // Used to extract the no-speech probability from the correct logit slice.
+    let sotIndex = sotTokens.count
+
+    sotTokens.append(contentsOf: tokenizer.sotSequence(language: options.language, task: options.task))
+    if options.timestamps == .none {
+      sotTokens.append(tokenizer.noTimestamps)
+    }
+    let initialTokenCount = sotTokens.count
+    let maxGenerateTokens = options.maxTokens - initialTokenCount
+
+    var tokensPerSeq: [[Int]] = Array(repeating: sotTokens, count: batchSize)
+    var donePerSeq: [Bool] = Array(repeating: false, count: batchSize)
+    var noSpeechProbPerSeq: [Float] = Array(repeating: 0.0, count: batchSize)
+    var stepLogProbsPerSeq: [[MLXArray]] = Array(repeating: [], count: batchSize)
+
+    // O(1) timestamp state per sequence (mirrors GreedyDecoder)
+    var lastWasTimestamp: [Bool] = Array(repeating: false, count: batchSize)
+    var penultimateWasTimestamp: [Bool] = Array(repeating: true, count: batchSize)  // vacuously true
+    var lastTimestampTokenValue: [Int] = Array(repeating: 0, count: batchSize)
+
+    var kvCache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]? = nil
+
+    for iteration in 0 ..< maxGenerateTokens {
+      // Build [B, n_tokens] input for this iteration
+      let tokensToProcess: MLXArray
+      if kvCache != nil {
+        // Subsequent: one token per sequence [B, 1]
+        // Done sequences keep feeding their last EOT token (KV cache must stay in sync)
+        let lastTokens = (0 ..< batchSize).map { b -> Int32 in
+          Int32(tokensPerSeq[b].last!)
+        }
+        tokensToProcess = MLXArray(lastTokens).reshaped(batchSize, 1)
+      } else {
+        // First: broadcast identical SOT sequence to all B sequences → [B, n_sot]
+        let sotRow = MLXArray(sotTokens.map { Int32($0) })
+        tokensToProcess = MLX.stacked(Array(repeating: sotRow, count: batchSize), axis: 0)
+      }
+
+      // GPU: forward pass for all B sequences simultaneously
+      let (logits, newCache, _) = model.decode(
+        tokensToProcess,
+        audioFeatures: audioFeaturesStack,
+        kvCache: kvCache
+      )
+      asyncEval(logits)
+      kvCache = newCache
+
+      // Sync GPU once to materialise all [B, vocab_size] logit slices
+      let lastLogitsAll = logits[0..., -1, 0...]  // [B, vocab_size]
+      eval(lastLogitsAll)
+      let vocabSize = lastLogitsAll.shape[1]
+      ensureMasksCached(vocabSize: vocabSize)
+
+      // Capture SOT-position logits for no-speech extraction at iteration 0
+      // (logits is already evaluated above, so this is a cheap CPU slice)
+      var sotLogitsAll: MLXArray? = nil
+      if iteration == 0 {
+        sotLogitsAll = logits[0..., sotIndex, 0...]  // [B, vocab_size]
+        eval(sotLogitsAll!)
+      }
+
+      // Per-sequence CPU processing (masks are cheap; GPU work already done)
+      let indices = _cachedIndices!
+
+      for b in 0 ..< batchSize {
+        if donePerSeq[b] { continue }
+
+        let numGenerated = tokensPerSeq[b].count - initialTokenCount
+        let lastLogits = lastLogitsAll[b]  // [vocab_size], already evaluated
+
+        // --- No-speech probability (iteration 0 only) ---
+        if iteration == 0, let sotAll = sotLogitsAll {
+          let probs = MLX.softmax(sotAll[b], axis: -1)
+          noSpeechProbPerSeq[b] = probs[tokenizer.noSpeech].item(Float.self)
+        }
+
+        // --- Base suppression mask ---
+        let baseMask = iteration == 0 ? _cachedBaseMaskFirst! : _cachedBaseMask!
+
+        // --- Timestamp rules mask ---
+        var timestampMask = MLXArray.zeros([vocabSize])
+        if options.timestamps != .none {
+          let boolState = MLXArray([
+            Int32(lastWasTimestamp[b] ? 1 : 0),
+            Int32(penultimateWasTimestamp[b] ? 1 : 0),
+          ])
+          let intState = MLXArray([
+            Int32(lastTimestampTokenValue[b]),
+            Int32(numGenerated),
+            Int32(tokenizer.timestampBegin),
+            Int32(tokenizer.noTimestamps),
+            Int32(tokenizer.eot),
+          ])
+          timestampMask = compiledTimestampRules(indices, boolState, intState)
+        }
+
+        // --- Timestamp force heuristic ---
+        if options.timestamps != .none, numGenerated > 0 {
+          let tsBeginScalar = MLXArray(Int32(tokenizer.timestampBegin))
+          let forceMask = compiledTimestampForce(lastLogits, indices, tsBeginScalar)
+          timestampMask = MLX.minimum(timestampMask, forceMask)
+        }
+
+        // --- N-gram repetition ban ---
+        // Build a suppression mask for any token that would complete a repeated n-gram.
+        // Done on CPU before the argmax — cheap because banned sets are typically small.
+        var ngramMask = MLXArray.zeros([vocabSize])
+        if options.noRepeatNgramSize >= 2 {
+          let banned = bannedNgramTokens(
+            tokens: tokensPerSeq[b],
+            initialTokenCount: initialTokenCount,
+            n: options.noRepeatNgramSize
+          )
+          if !banned.isEmpty {
+            var ngramVals = [Float](repeating: 0.0, count: vocabSize)
+            for token in banned where token < vocabSize {
+              ngramVals[token] = -Float.infinity
+            }
+            ngramMask = MLXArray(ngramVals)
+          }
+        }
+
+        // --- Combine & apply ---
+        let finalMask = MLX.minimum(MLX.minimum(baseMask, timestampMask), ngramMask)
+        let maskedLogits = compiledApplyMask(lastLogits, finalMask)
+
+        // --- Sample ---
+        let nextTokenId: Int
+        if options.temperature == 0.0 {
+          nextTokenId = Int(compiledArgmax(maskedLogits).item(Int32.self))
+        } else {
+          let probs = MLX.softmax(maskedLogits / options.temperature, axis: -1)
+          nextTokenId = Int(MLXRandom.categorical(MLX.log(probs + 1e-10)).item(Int32.self))
+        }
+
+        // --- Accumulate log-prob (lazy, non-EOT only) ---
+        if nextTokenId != tokenizer.eot {
+          let lse = MLX.logSumExp(lastLogits, axes: [-1])
+          let logProb = MLX.take(lastLogits, MLXArray(Int32(nextTokenId))) - lse
+          stepLogProbsPerSeq[b].append(logProb)
+        }
+
+        tokensPerSeq[b].append(nextTokenId)
+
+        // --- Update timestamp state (mirrors GreedyDecoder exactly) ---
+        let isTs = nextTokenId >= tokenizer.timestampBegin
+        penultimateWasTimestamp[b] = (numGenerated == 0) ? true : lastWasTimestamp[b]
+        lastWasTimestamp[b] = isTs
+        if isTs {
+          lastTimestampTokenValue[b] = nextTokenId
+          if penultimateWasTimestamp[b] { lastTimestampTokenValue[b] += 1 }
+        }
+
+        if nextTokenId == tokenizer.eot {
+          donePerSeq[b] = true
+        }
+      }
+
+      if donePerSeq.allSatisfy({ $0 }) { break }
+    }
+
+    return (0 ..< batchSize).map { b in
+      var generatedTokens = Array(tokensPerSeq[b][initialTokenCount...])
+      // Strip EOT (matches GreedyDecoder)
+      if let eotIndex = generatedTokens.firstIndex(of: tokenizer.eot) {
+        generatedTokens = Array(generatedTokens[..<eotIndex])
+      }
+      let text = tokenizer.decode(generatedTokens)
+
+      let avgLogProb: Float
+      if stepLogProbsPerSeq[b].isEmpty {
+        avgLogProb = 0.0
+      } else {
+        let summed = MLX.stacked(stepLogProbsPerSeq[b], axis: 0).sum()
+        eval(summed)
+        avgLogProb = summed.item(Float.self) / Float(stepLogProbsPerSeq[b].count)
+      }
+
+      return DecodingResult(
+        tokens: generatedTokens,
+        text: text,
+        avgLogProb: avgLogProb,
+        noSpeechProb: noSpeechProbPerSeq[b],
+        temperature: options.temperature,
+        compressionRatio: computeCompressionRatio(text)
+      )
+    }
+  }
 }

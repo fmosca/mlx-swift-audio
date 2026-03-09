@@ -94,15 +94,26 @@ class WhisperModel: Module {
     return logits
   }
 
-  /// Forward pass with cross-attention weights (for word-level timestamps)
+  /// Forward pass with cross-attention weights (for word-level timestamps).
+  /// Encodes `mel` then runs the decoder with cross-attention capture.
   ///
-  /// - Parameters:
-  ///   - mel: Mel spectrogram (batch, n_mels, n_frames)
-  ///   - tokens: Token indices (batch, n_tokens)
-  /// - Returns: Tuple of (logits, cross_attention_weights)
+  /// Use `decodeWithCrossQK` instead when audio features are already available
+  /// (e.g. from a prior `compiledEncode` call) to avoid re-encoding.
   func forwardWithCrossQK(_ mel: MLXArray, tokens: MLXArray) -> (MLXArray, [MLXArray?]) {
     let audioFeatures = encode(mel)
     let (logits, _, crossQK) = decode(tokens, audioFeatures: audioFeatures)
+    return (logits, crossQK)
+  }
+
+  /// Decoder-only pass with cross-attention weight capture.
+  ///
+  /// Skips the encoder entirely — use when `audioFeatures` ([n_ctx, n_state] or
+  /// [1, n_ctx, n_state]) were already produced by a prior encode call.  In the
+  /// batched transcription path this avoids re-encoding the same mel N times.
+  func decodeWithCrossQK(_ audioFeatures: MLXArray, tokens: MLXArray) -> (MLXArray, [MLXArray?]) {
+    var features = audioFeatures
+    if features.ndim == 2 { features = features.expandedDimensions(axis: 0) }
+    let (logits, _, crossQK) = decode(tokens, audioFeatures: features)
     return (logits, crossQK)
   }
 

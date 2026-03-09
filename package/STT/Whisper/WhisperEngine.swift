@@ -207,6 +207,60 @@ public final class WhisperEngine: STTEngine {
     return result
   }
 
+  /// Transcribe audio using Silero VAD-guided hybrid batching (offline fast path).
+  ///
+  /// Runs Silero VAD (CoreML, ANE-accelerated) to split at natural silence boundaries,
+  /// then processes all segments in parallel batches of `batchSize`, amortising GPU
+  /// weight-read cost across the batch.  `conditionOnPreviousText` is always `false`.
+  ///
+  /// The Silero model is downloaded and cached by FluidAudio on first use
+  /// (~2 MB, stored in Application Support/FluidAudio/Models).
+  ///
+  /// - Parameters:
+  ///   - url: URL to audio file
+  ///   - language: Language code (nil = auto-detect from first 30 s)
+  ///   - temperature: Sampling temperature (0 = greedy)
+  ///   - timestamps: Timestamp granularity
+  ///   - batchSize: Segments encoded and decoded in parallel (default 4)
+  ///   - hallucinationSilenceThreshold: When word timestamps are enabled, segments
+  ///     whose word-level alignment contains an inter-word gap longer than this (seconds)
+  ///     are discarded as likely hallucinations.  Default 2.0 s; set to `.infinity` to disable.
+  /// - Returns: Assembled transcription result
+  public nonisolated func transcribeBatched(
+    _ url: URL,
+    language: Language? = nil,
+    temperature: Float = 0.0,
+    timestamps: TimestampGranularity = .segment,
+    hallucinationSilenceThreshold: Double = 2.0,
+    batchSize: Int = 4
+  ) async throws -> TranscriptionResult {
+    guard await isLoaded, let whisperSTT = await whisperSTT else {
+      throw STTError.modelNotLoaded
+    }
+
+    guard await !isTranscribing else {
+      throw STTError.invalidArgument("Transcription already in progress")
+    }
+
+    await MainActor.run { isTranscribing = true }
+    defer { Task { await MainActor.run { isTranscribing = false } } }
+
+    let audio16k = try loadAndPreprocessAudio(from: url)
+
+    let result = try await whisperSTT.transcribeBatched(
+      audio: audio16k,
+      language: language?.code,
+      task: .transcribe,
+      temperature: temperature,
+      timestamps: timestamps,
+      hallucinationSilenceThreshold: hallucinationSilenceThreshold,
+      batchSize: batchSize
+    )
+
+    await MainActor.run { transcriptionTime = result.processingTime }
+    return result
+  }
+
   /// Translate audio to English from a URL
   ///
   /// - Parameters:

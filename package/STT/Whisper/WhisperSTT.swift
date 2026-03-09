@@ -3,6 +3,7 @@
 // Ported to MLX from https://github.com/openai/whisper
 // License: licenses/whisper.txt
 
+import FluidAudio
 import Foundation
 import MLX
 import Synchronization
@@ -18,9 +19,51 @@ actor WhisperSTT {
 
   // MARK: - Initialization
 
+  // Lazily initialised on the first transcribeBatched() call; cached for reuse.
+  private var vadManager: VadManager?
+
   private init(model: WhisperModel, tokenizer: WhisperTokenizer) {
     self.model = model
     self.tokenizer = tokenizer
+  }
+
+  /// Coalesces consecutive VAD segments into larger chunks without exceeding `maxDuration`.
+  ///
+  /// Silero produces many short segments (median ~6 s on real meeting audio).  Merging
+  /// them packs more speech into each Whisper context window, reducing the total number
+  /// of encoder passes and improving GPU utilisation in the batched path.
+  ///
+  /// The merge is greedy left-to-right: extend the current merged segment with the next
+  /// VAD segment as long as the combined span stays within `maxDuration`.  When it would
+  /// overflow, flush the current segment and start a new one.  This preserves chronological
+  /// order and never crosses a silence boundary that Silero deemed significant enough to
+  /// split on — it only skips *within* the available slack.
+  private func mergeAdjacentSegments(_ segments: [VadSegment], maxDuration: TimeInterval = 29.0) -> [VadSegment] {
+    guard !segments.isEmpty else { return [] }
+    var merged: [VadSegment] = []
+    var mergeStart = segments[0].startTime
+    var mergeEnd = segments[0].endTime
+
+    for seg in segments.dropFirst() {
+      if seg.endTime - mergeStart <= maxDuration {
+        mergeEnd = seg.endTime
+      } else {
+        merged.append(VadSegment(startTime: mergeStart, endTime: mergeEnd))
+        mergeStart = seg.startTime
+        mergeEnd = seg.endTime
+      }
+    }
+    merged.append(VadSegment(startTime: mergeStart, endTime: mergeEnd))
+    return merged
+  }
+
+  private func getVadManager() async throws -> VadManager {
+    if let existing = vadManager { return existing }
+    // VadManager resolves its model directory from Application Support by default,
+    // which is where FluidAudio caches the compiled .mlmodelc on first download.
+    let manager = try await VadManager(config: VadConfig(computeUnits: .cpuAndNeuralEngine))
+    vadManager = manager
+    return manager
   }
 
   /// Load WhisperSTT from Hugging Face Hub by model size enum.
@@ -644,6 +687,333 @@ actor WhisperSTT {
       language: detectedLanguage ?? language ?? "en",
       segments: allSegments,
       processingTime: totalTime,
+      duration: audioDuration
+    )
+  }
+
+  // MARK: - Batched Transcription
+
+  /// Transcribe audio using VAD-guided hybrid batching for offline workloads.
+  ///
+  /// Runs an energy-based VAD pass first to locate natural silence boundaries,
+  /// then routes segments to two parallel paths:
+  /// - **Short segments (≤ 29 s):** packed into batches of `batchSize` and processed
+  ///   with a single batched encoder + parallel decode loop, amortising GPU weight-load
+  ///   cost across the batch.
+  /// - **Long segments (> 29 s):** processed sequentially in 30-second windows via the
+  ///   standard single-sequence decoder.
+  ///
+  /// Because `conditionOnPreviousText` is always `false` in the batched path (no inter-segment
+  /// autoregressive dependency), the shared SOT prefix keeps all KV caches in sync throughout
+  /// the parallel decode loop.
+  ///
+  /// - Parameters:
+  ///   - audio: Audio waveform (T,) at 16 kHz
+  ///   - language: Optional language code; `nil` triggers auto-detection from the first 30 s
+  ///   - task: Transcription or translation
+  ///   - temperature: Sampling temperature (0 = greedy)
+  ///   - timestamps: Timestamp granularity for each segment
+  ///   - noSpeechThreshold: Segments above this probability are discarded
+  ///   - logprobThreshold: Low-confidence gate (average log-probability per token)
+  ///   - batchSize: Number of short segments to encode and decode in parallel
+  ///   - minSilenceDuration: Minimum silence gap (seconds) to split at
+  ///   - silenceThresholdDB: Energy threshold (dBFS) below which a frame is silent
+  /// - Returns: Assembled `TranscriptionResult` with chronologically ordered segments
+  func transcribeBatched(
+    audio: MLXArray,
+    language: String?,
+    task: TranscriptionTask,
+    temperature: Float,
+    timestamps: TimestampGranularity,
+    noSpeechThreshold: Float? = 0.6,
+    logprobThreshold: Float? = -1.0,
+    hallucinationSilenceThreshold: Double = 2.0,
+    batchSize: Int = 4
+  ) async throws -> TranscriptionResult {
+    let wallStart = CFAbsoluteTimeGetCurrent()
+    let sampleRate = WhisperAudio.sampleRate
+    let hopLength = WhisperAudio.hopLength
+    let nMels = model.dims.n_mels
+    let nFrames = WhisperAudio.nFrames
+
+    // Materialise audio on the CPU for Silero VAD
+    eval(audio)
+    let audioFloats = audio.asArray(Float.self)
+    let totalSamples = audioFloats.count
+    let audioDuration = Double(totalSamples) / Double(sampleRate)
+
+    // Silero VAD: find speech segments at natural silence boundaries.
+    // maxSpeechDuration: 29 s keeps every segment within Whisper's 30-second context window,
+    // so all output from segmentSpeech() feeds the short (batched) path.
+    let vadMgr = try await getVadManager()
+    // maxSpeechDuration: 29 s to stay within Whisper's 30-second context window.
+    // minSilenceDuration: 0.5 s — tighter than FluidAudio's 0.75 s default to preserve
+    // short pauses as segment boundaries rather than merging them into longer segments.
+    let vadSegConfig = VadSegmentationConfig(
+      minSpeechDuration: 0.15,
+      minSilenceDuration: 0.5,
+      maxSpeechDuration: 29.0,
+      speechPadding: 0.1,
+      silenceThresholdForSplit: 0.3
+    )
+    let vadSegments = try await vadMgr.segmentSpeech(audioFloats, config: vadSegConfig)
+
+    // Merge adjacent segments to fill Whisper's 30-second context window more efficiently.
+    // Silero produces a median segment of ~6 s on real meeting audio; merging reduces
+    // encoder passes by packing more speech per batch slot.
+    let mergedSegments = mergeAdjacentSegments(vadSegments)
+
+    // With maxSpeechDuration = 29 s, Silero guarantees all segments ≤ 29 s before merging.
+    // After merging we still respect the 29 s cap, so longSegments is expected to be empty.
+    // The fallback to the sequential decoder is retained as a safety net.
+    let shortSegments = mergedSegments.filter { $0.duration <= 29.0 }
+    let longSegments  = mergedSegments.filter { $0.duration >  29.0 }
+    Log.model.info(
+      "Silero VAD: \(vadSegments.count) raw → \(mergedSegments.count) merged segments from \(String(format: "%.1f", audioDuration))s audio (short: \(shortSegments.count), long: \(longSegments.count))"
+    )
+
+    // Compute mel spectrogram for the full audio once (pad with 30 s silence to handle boundaries)
+    let paddedAudio = MLX.concatenated([audio, MLXArray.zeros([WhisperAudio.nSamples])], axis: 0)
+    let fullMel = whisperLogMelSpectrogram(audio: paddedAudio, nMels: nMels)
+    eval(fullMel)
+    let totalMelFrames = fullMel.shape[0]
+
+    // Language detection from first 30 s if needed
+    var detectedLanguage: String? = nil
+    if language == nil {
+      let firstMel = padOrTrimMel(fullMel[0 ..< min(nFrames, totalMelFrames)], length: nFrames)
+      let batchedMel = firstMel.expandedDimensions(axis: 0).asType(.float16)
+      let (lang, prob) = detectLanguageFromMel(batchedMel)
+      detectedLanguage = lang
+      Log.model.info("Detected language: \(lang) (probability: \(String(format: "%.2f", prob)))")
+    }
+    let languageToUse = language ?? detectedLanguage ?? "en"
+
+    // Base options — prompt is updated per-batch for inter-batch conditioning.
+    //
+    // timestamps: .none — VAD provides segment boundaries; Whisper's internal
+    //   timestamp tokens are redundant in the batched path and add per-step
+    //   computation (timestamp rules, forcing heuristic).  The alignment pass in
+    //   findAlignment constructs its own noTimestamps sequence independently.
+    //
+    // noRepeatNgramSize: 3 — mirrors faster-whisper's default; prevents the model
+    //   from repeating any 3-gram, which eliminates the boundary hallucinations
+    //   ("Okay. Okay. Okay.") that survive the compression-ratio gate.
+    let baseOptions = DecodingOptions(
+      task: task,
+      language: languageToUse,
+      temperature: temperature,
+      maxTokens: 448,
+      timestamps: .none,
+      prompt: [],
+      noRepeatNgramSize: 3
+    )
+
+    // Collect (globalStartTime, TranscriptionSegment) for chronological assembly
+    var collected: [(globalStart: TimeInterval, segment: TranscriptionSegment)] = []
+
+    // Helper: convert sample index to mel frame index
+    func sampleToFrame(_ sample: Int) -> Int { min(sample / hopLength, totalMelFrames) }
+
+    // Helper: accept-or-discard a DecodingResult based on quality gates.
+    // Mirrors Python's whisper: no-speech probability, avg log-prob, AND
+    // compression ratio (> 2.4 means the text is highly repetitive / hallucinated).
+    func shouldAccept(_ result: DecodingResult) -> Bool {
+      if result.compressionRatio > 2.4 { return false }
+      guard let threshold = noSpeechThreshold else { return true }
+      if result.noSpeechProb > threshold {
+        if let lp = logprobThreshold, result.avgLogProb > lp { return true }
+        return false
+      }
+      return true
+    }
+
+    // MARK: Short segments — batched path
+
+    let batchDecoder = BatchedGreedyDecoder(model: model, tokenizer: tokenizer)
+
+    // Inter-batch conditioning: carry the last batch's prompt tokens forward.
+    // All segments in a batch share the same prompt (from the previous batch's
+    // last segment) — an approximation that eliminates boundary hallucinations
+    // while preserving the parallelism benefit.
+    var batchPrompt: [Int] = []
+
+    var idx = 0
+    while idx < shortSegments.count {
+      let end = min(idx + batchSize, shortSegments.count)
+      let batch = Array(shortSegments[idx ..< end])
+
+      // Slice mel frames for each segment; track valid (pre-padding) frame counts for DTW.
+      var melSlices: [MLXArray] = []
+      var validFrameCounts: [Int] = []
+      for seg in batch {
+        let startFrame = sampleToFrame(seg.startSample(sampleRate: sampleRate))
+        let endFrame = min(sampleToFrame(seg.endSample(sampleRate: sampleRate)), totalMelFrames)
+        let validFrames = max(1, min(endFrame - startFrame, nFrames))
+        let slice = endFrame > startFrame ? fullMel[startFrame ..< endFrame] : fullMel[0 ..< 1]
+        melSlices.append(padOrTrimMel(slice, length: nFrames).asType(.float16))
+        validFrameCounts.append(validFrames)
+      }
+
+      // Stack into [B, nFrames, nMels] and encode in one GPU pass
+      let melStack = MLX.stacked(melSlices, axis: 0)
+      let audioFeaturesStack = model.compiledEncode(melStack)
+      eval(audioFeaturesStack)
+
+      let batchOptions = batchPrompt.isEmpty
+        ? baseOptions
+        : DecodingOptions(
+            task: baseOptions.task,
+            language: baseOptions.language,
+            temperature: baseOptions.temperature,
+            maxTokens: baseOptions.maxTokens,
+            timestamps: baseOptions.timestamps,
+            prompt: batchPrompt
+          )
+
+      let results = batchDecoder.decodeBatch(audioFeaturesStack: audioFeaturesStack, options: batchOptions)
+
+      // Update prompt for the next batch: use the last segment's raw tokens
+      // (including timestamps), stripping only EOT.  Mirrors Python's behavior
+      // where condition_on_previous_text passes result.tokens as the next prompt.
+      if let lastResult = results.last {
+        batchPrompt = lastResult.tokens.filter { $0 != tokenizer.eot }
+      }
+
+      for (batchIdx, (seg, result)) in zip(batch, results).enumerated() {
+        guard shouldAccept(result) else { continue }
+        let textTokens = result.tokens.filter { $0 < tokenizer.eot }
+        let text = tokenizer.decode(textTokens).trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { continue }
+
+        var segment = TranscriptionSegment(
+          text: text,
+          start: seg.startTime,
+          end: seg.endTime,
+          tokens: result.tokens,
+          avgLogProb: result.avgLogProb,
+          noSpeechProb: result.noSpeechProb,
+          words: nil
+        )
+
+        if timestamps == .word {
+          // Decoder-only alignment pass: reuse audioFeaturesStack[batchIdx]
+          // from the encode step above, skipping the encoder re-run entirely.
+          var segs = [segment]
+          _ = addWordTimestamps(
+            segments: &segs,
+            model: model,
+            tokenizer: tokenizer,
+            mel: melSlices[batchIdx],
+            audioFeatures: audioFeaturesStack[batchIdx],
+            numFrames: validFrameCounts[batchIdx],
+            language: languageToUse,
+            task: task,
+            timeOffset: Float(seg.startTime),
+            lastSpeechTimestamp: Float(seg.startTime)
+          )
+          segment = segs[0]
+
+          // Hallucination silence gate: if any inter-word gap exceeds the threshold
+          // the DTW aligner found a long silence inside what VAD marked as speech —
+          // almost certainly a hallucination.  Mirrors faster-whisper's
+          // hallucination_silence_threshold logic.
+          if let words = segment.words, words.count > 1 {
+            let maxGap = zip(words, words.dropFirst())
+              .map { Double($1.start) - Double($0.end) }
+              .max() ?? 0
+            if maxGap > hallucinationSilenceThreshold {
+              continue
+            }
+          }
+        }
+
+        collected.append((globalStart: seg.startTime, segment: segment))
+      }
+
+      idx = end
+    }
+
+    // MARK: Long segments — sequential 30-second window path (rare with Silero)
+
+    let seqDecoder = GreedyDecoder(model: model, tokenizer: tokenizer)
+
+    for seg in longSegments {
+      var windowStartFrame = sampleToFrame(seg.startSample(sampleRate: sampleRate))
+      let segEndFrame = sampleToFrame(seg.endSample(sampleRate: sampleRate))
+
+      while windowStartFrame < segEndFrame {
+        let windowEndFrame = min(windowStartFrame + nFrames, segEndFrame)
+        let slice = fullMel[windowStartFrame ..< windowEndFrame]
+        // Keep 2D mel (float16) for DTW; add batch dim only for the encoder.
+        let windowMel = padOrTrimMel(slice, length: nFrames).asType(.float16)
+        let audioFeatures = model.compiledEncode(windowMel.expandedDimensions(axis: 0))
+        eval(audioFeatures)
+
+        let result = seqDecoder.decode(audioFeatures: audioFeatures, options: baseOptions)
+
+        guard shouldAccept(result) else {
+          windowStartFrame = windowEndFrame
+          continue
+        }
+
+        let windowStartTime = TimeInterval(windowStartFrame * hopLength) / TimeInterval(sampleRate)
+        let windowEndTime = TimeInterval(windowEndFrame * hopLength) / TimeInterval(sampleRate)
+        let textTokens = result.tokens.filter { $0 < tokenizer.eot }
+        let text = tokenizer.decode(textTokens).trimmingCharacters(in: .whitespaces)
+
+        if !text.isEmpty {
+          var segment = TranscriptionSegment(
+            text: text,
+            start: windowStartTime,
+            end: windowEndTime,
+            tokens: result.tokens,
+            avgLogProb: result.avgLogProb,
+            noSpeechProb: result.noSpeechProb,
+            words: nil
+          )
+
+          if timestamps == .word {
+            var segs = [segment]
+            _ = addWordTimestamps(
+              segments: &segs,
+              model: model,
+              tokenizer: tokenizer,
+              mel: windowMel,
+              numFrames: windowEndFrame - windowStartFrame,
+              language: languageToUse,
+              task: task,
+              timeOffset: Float(windowStartTime),
+              lastSpeechTimestamp: Float(windowStartTime)
+            )
+            segment = segs[0]
+          }
+
+          collected.append((globalStart: windowStartTime, segment: segment))
+        }
+
+        windowStartFrame = windowEndFrame
+      }
+    }
+
+    // Assemble in chronological order
+    collected.sort { $0.globalStart < $1.globalStart }
+    let orderedSegments = collected.map { $0.segment }
+
+    // Decode full text from all token sequences together for natural spacing
+    let allTextTokens = orderedSegments.flatMap { $0.tokens }.filter { $0 < tokenizer.eot }
+    let fullText = tokenizer.decode(allTextTokens).trimmingCharacters(in: .whitespaces)
+
+    let processingTime = CFAbsoluteTimeGetCurrent() - wallStart
+    Log.model.info(
+      "Batched transcription: \(String(format: "%.2f", processingTime))s for \(String(format: "%.2f", audioDuration))s audio (RTF: \(String(format: "%.4f", processingTime / audioDuration)))"
+    )
+
+    return TranscriptionResult(
+      text: fullText,
+      language: detectedLanguage ?? language ?? "en",
+      segments: orderedSegments,
+      processingTime: processingTime,
       duration: audioDuration
     )
   }

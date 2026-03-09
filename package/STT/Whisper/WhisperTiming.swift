@@ -560,6 +560,7 @@ func findAlignment(
   tokenizer: WhisperTokenizer,
   textTokens: [Int],
   mel: MLXArray,
+  audioFeatures: MLXArray? = nil,
   numFrames: Int,
   language: String?,
   task: TranscriptionTask,
@@ -584,14 +585,16 @@ func findAlignment(
 
   let tokenArray = MLXArray(tokens.map { Int32($0) }).expandedDimensions(axis: 0)
 
-  // Ensure mel has batch dimension
-  var melBatched = mel
-  if mel.ndim == 2 {
-    melBatched = mel.expandedDimensions(axis: 0)
+  // Forward pass with cross-attention extraction.
+  // When pre-computed audio features are provided, skip the encoder entirely.
+  let (logits, crossQK): (MLXArray, [MLXArray?])
+  if let features = audioFeatures {
+    (logits, crossQK) = model.decodeWithCrossQK(features, tokens: tokenArray)
+  } else {
+    var melBatched = mel
+    if mel.ndim == 2 { melBatched = mel.expandedDimensions(axis: 0) }
+    (logits, crossQK) = model.forwardWithCrossQK(melBatched, tokens: tokenArray)
   }
-
-  // Forward pass with cross-attention extraction
-  let (logits, crossQK) = model.forwardWithCrossQK(melBatched, tokens: tokenArray)
   eval(logits) // Ensure computation is complete
 
   // Get text token probabilities for confidence scores
@@ -849,6 +852,7 @@ func addWordTimestamps(
   model: WhisperModel,
   tokenizer: WhisperTokenizer,
   mel: MLXArray,
+  audioFeatures: MLXArray? = nil,
   numFrames: Int,
   language: String?,
   task: TranscriptionTask,
@@ -867,12 +871,14 @@ func addWordTimestamps(
 
   guard !allTextTokens.isEmpty else { return lastSpeechTimestamp }
 
-  // Single findAlignment call for ALL segments (key optimization)
+  // Single findAlignment call for ALL segments (key optimization).
+  // Pass pre-computed audioFeatures if available to skip the encoder re-run.
   var alignment = findAlignment(
     model: model,
     tokenizer: tokenizer,
     textTokens: allTextTokens,
     mel: mel,
+    audioFeatures: audioFeatures,
     numFrames: numFrames,
     language: language,
     task: task
