@@ -192,6 +192,9 @@ actor WhisperSTT {
     var promptResetSince = 0
     var lastSpeechTimestamp: Float = 0.0
 
+    // Reuse decoder across segments and temperature fallbacks to reduce allocation overhead
+    let decoder = GreedyDecoder(model: model, tokenizer: tokenizer)
+
     while seek < contentFrames {
       let timeOffset = Float(seek * hopLength) / Float(sampleRate)
       let windowEndTime = Float((seek + nFrames) * hopLength) / Float(sampleRate)
@@ -214,15 +217,18 @@ actor WhisperSTT {
       // Try increasing temperatures when output is too repetitive (high compression ratio)
       // or has low confidence (low avg_logprob)
       //
-      // Optimization: Use fewer temperature steps for very short segments where
-      // fallbacks are unlikely to help and just waste time
+      // Optimization: Encode once per segment, decode multiple times with different
+      // temperatures. Encoder pass is expensive; decoder only needs temperature change.
       let temperatureFallbackSequence: [Float] = segmentDuration < 2.0
         ? [0.0, 0.5, 1.0] // Short segments: 3 steps
         : [0.0, 0.2, 0.4, 0.6, 0.8, 1.0] // Normal segments: 6 steps
       var result: DecodingResult!
 
+      // Encode once per segment (expensive); reuse across temperature fallbacks
+      let audioFeatures = model.encode(batchedMel)
+      eval(audioFeatures)
+
       for currentTemperature in temperatureFallbackSequence {
-        // Create decoding options with current temperature
         let options = DecodingOptions(
           task: task,
           language: languageToUse,
@@ -232,9 +238,7 @@ actor WhisperSTT {
           prompt: prompt
         )
 
-        // Decode segment
-        let decoder = GreedyDecoder(model: model, tokenizer: tokenizer, options: options)
-        result = decoder.decode(batchedMel)
+        result = decoder.decode(audioFeatures: audioFeatures, options: options)
 
         // Check if we need to retry with higher temperature
         var needsFallback = false

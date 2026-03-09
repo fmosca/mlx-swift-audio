@@ -7,6 +7,7 @@ import Compression
 import Foundation
 import MLX
 import MLXNN
+import MLXRandom
 
 // MARK: - Decoding Options
 
@@ -73,31 +74,59 @@ struct DecodingResult {
   let compressionRatio: Float
 }
 
+// MARK: - Cache Flattening for asyncEval
+
+/// Flatten Whisper KV cache into [MLXArray] for asyncEval.
+/// asyncEval's collect() does not handle Optional, so we flatten manually.
+private func flattenWhisperCache(
+  _ cache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]?
+) -> [MLXArray] {
+  guard let cache = cache else { return [] }
+  var result: [MLXArray] = []
+  for layer in cache {
+    if let sa = layer.0 { result.append(contentsOf: [sa.0, sa.1]) }
+    if let ca = layer.1 { result.append(contentsOf: [ca.0, ca.1]) }
+  }
+  return result
+}
+
 // MARK: - Greedy Decoder
 
 /// Greedy decoder for Whisper
 ///
-/// Implements simple greedy decoding with KV caching
+/// Implements simple greedy decoding with KV caching.
+/// Use `decode(audioFeatures:options:)` when encoding once and decoding multiple times
+/// (e.g. temperature fallback) to avoid redundant encoder passes.
 class GreedyDecoder {
   let model: WhisperModel
   let tokenizer: WhisperTokenizer
-  let options: DecodingOptions
 
-  init(model: WhisperModel, tokenizer: WhisperTokenizer, options: DecodingOptions) {
+  init(model: WhisperModel, tokenizer: WhisperTokenizer) {
     self.model = model
     self.tokenizer = tokenizer
-    self.options = options
   }
 
-  /// Decode an audio segment
+  /// Decode from mel spectrogram (encodes then decodes).
+  /// Use `decode(audioFeatures:options:)` when reusing encoder output across temperature fallbacks.
   ///
-  /// - Parameter mel: Mel spectrogram (batch=1, n_mels, n_frames)
+  /// - Parameters:
+  ///   - mel: Mel spectrogram (batch=1, n_mels, n_frames)
+  ///   - options: Decoding options (temperature, prompt, etc.)
   /// - Returns: Decoding result
-  func decode(_ mel: MLXArray) -> DecodingResult {
-    // Encode audio to features
+  func decode(_ mel: MLXArray, options: DecodingOptions) -> DecodingResult {
     let audioFeatures = model.encode(mel)
-    eval(audioFeatures) // Ensure audio features are fully computed
+    eval(audioFeatures)
+    return decode(audioFeatures: audioFeatures, options: options)
+  }
 
+  /// Decode from precomputed audio features.
+  /// Reuse audio features across temperature fallbacks to avoid redundant encoder passes.
+  ///
+  /// - Parameters:
+  ///   - audioFeatures: Output of `model.encode(mel)` (batch=1, n_audio_ctx, n_audio_state)
+  ///   - options: Decoding options (temperature, prompt, etc.)
+  /// - Returns: Decoding result
+  func decode(audioFeatures: MLXArray, options: DecodingOptions) -> DecodingResult {
     // Build initial token sequence
     // If prompt tokens are provided, prepend them with <|startofprev|>
     // This matches Python's behavior for condition_on_previous_text
@@ -148,7 +177,9 @@ class GreedyDecoder {
     }()
     _ = vocabSizeForMask  // suppress unused warning; real masks built after first pass
 
-    // Autoregressive decoding
+    // Autoregressive decoding with async eval pipelining.
+    // Pattern: overlap GPU compute (iteration N) with CPU sync for token (iteration N-1).
+    // See FunASR/FunASRSTT.swift and T3Turbo.swift for reference.
     var kvCache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]? = nil
     var noSpeechProb: Float = 0.0
     var cachedLogits: [MLXArray] = []
@@ -159,14 +190,17 @@ class GreedyDecoder {
     var cachedBaseMask: MLXArray? = nil          // without SuppressBlank (iterations > 0)
     var cachedBaseMaskFirst: MLXArray? = nil     // with SuppressBlank (iteration 0)
 
+    // Lazy token from previous iteration; we sync for it at start of next iteration
+    // after kicking off the forward pass (async pipelining).
+    var prevTokenLazy: MLXArray? = nil
+
     for iteration in 0 ..< maxGenerateTokens {
       // Convert tokens to MLXArray
       // With KV caching: only pass new token(s), not all tokens
       let tokensToProcess: MLXArray
-      if kvCache != nil {
-        // Pass only the last token (the new one)
-        let lastToken = tokens.last!
-        tokensToProcess = MLXArray([Int32(lastToken)]).expandedDimensions(axis: 0)
+      if let prev = prevTokenLazy {
+        // Pipelined: use lazy token from previous iteration (no sync yet)
+        tokensToProcess = prev.expandedDimensions(axis: 0)
       } else {
         // First iteration: pass all initial tokens (SOT sequence)
         tokensToProcess = MLXArray(tokens.map { Int32($0) }).expandedDimensions(axis: 0)
@@ -178,25 +212,35 @@ class GreedyDecoder {
         audioFeatures: audioFeatures,
         kvCache: kvCache
       )
-      eval(logits) // Ensure logits are computed before use
 
-      // Compute no-speech probability from first forward pass
-      // Extract logits at SOT position (matches Python: pre_logits[:, sot_index])
+      // Iteration 0: must sync for noSpeechProb and mask building.
+      // Iteration >= 1: asyncEval to overlap GPU compute with CPU sync for prev token.
       if iteration == 0 {
-        // logits shape: [batch=1, seq_len, vocab_size]
-        // Use sotIndex to get logits at the SOT position (not the last position)
-        // This is where the model decides if there's speech or silence
-        let sotLogits = logits[0, sotIndex] // [vocab_size]
+        eval(logits)
+      } else {
+        var toEval: [MLXArray] = [logits]
+        toEval.append(contentsOf: flattenWhisperCache(newCache))
+        asyncEval(toEval)
+      }
 
-        // Apply softmax to get probabilities
-        let probs = MLX.softmax(sotLogits, axis: -1)
-
-        // Extract probability for no-speech token
-        noSpeechProb = probs[tokenizer.noSpeech].item(Float.self)
+      // Sync for previous token (iteration >= 1). GPU is already computing current step.
+      if let prev = prevTokenLazy {
+        let prevTokenId = Int(prev.item(Int32.self))
+        tokens.append(prevTokenId)
+        if prevTokenId == tokenizer.eot {
+          break
+        }
       }
 
       // Update KV cache
       kvCache = newCache
+
+      // Compute no-speech probability from first forward pass
+      if iteration == 0 {
+        let sotLogits = logits[0, sotIndex]
+        let probs = MLX.softmax(sotLogits, axis: -1)
+        noSpeechProb = probs[tokenizer.noSpeech].item(Float.self)
+      }
 
       // Get logits for last token
       var lastLogits = logits[0, -1]
@@ -207,11 +251,8 @@ class GreedyDecoder {
 
       // =============================================================================
       // STEP 1: Base suppression mask (SuppressBlank + SuppressTokens)
-      // Computed once on the first iteration and cached; rebuilding a 207 KB Float
-      // array + MLXArray on every token step is the dominant CPU overhead.
       // =============================================================================
       if cachedIndices == nil {
-        // Build the constant parts once
         cachedIndices = MLXArray(Int32(0) ..< Int32(vocabSize))
 
         var baseIds = tokenizer.nonSpeechTokens()
@@ -224,7 +265,6 @@ class GreedyDecoder {
         for id in baseIds where id < vocabSize { maskValues[id] = -Float.infinity }
         cachedBaseMask = MLXArray(maskValues)
 
-        // SuppressBlank variant: also suppress space/EOT on the very first generated token
         var firstMaskValues = maskValues
         if let blankTokens = try? tokenizer.encode(" ") {
           for id in blankTokens where id < vocabSize { firstMaskValues[id] = -Float.infinity }
@@ -242,7 +282,6 @@ class GreedyDecoder {
       var timestampMask = MLXArray.zeros([vocabSize])
 
       if options.timestamps != .none {
-        // Suppress no-timestamps token
         timestampMask = MLX.where(
           indices .== Int32(tokenizer.noTimestamps),
           MLXArray(-Float.infinity),
@@ -254,14 +293,12 @@ class GreedyDecoder {
 
         if lastWasTimestamp {
           if penultimateWasTimestamp {
-            // Two timestamps in a row: suppress all timestamps (indices >= timestampBegin)
             timestampMask = MLX.where(
               indices .>= Int32(tokenizer.timestampBegin),
               MLXArray(-Float.infinity),
               timestampMask
             )
           } else {
-            // Text then timestamp: suppress all text tokens (indices < eot)
             timestampMask = MLX.where(
               indices .< Int32(tokenizer.eot),
               MLXArray(-Float.infinity),
@@ -270,9 +307,6 @@ class GreedyDecoder {
           }
         }
 
-        // Enforce timestamp monotonicity (Python lines 359-368)
-        // Find the last timestamp TOKEN VALUE in the generated sequence
-        // Then forbid generating any timestamp smaller than it
         let generatedTokens = tokens.suffix(numGenerated)
         let timestampTokenValues = generatedTokens.compactMap { token -> Int? in
           token > tokenizer.timestampBegin ? token : nil
@@ -280,31 +314,25 @@ class GreedyDecoder {
 
         if !timestampTokenValues.isEmpty {
           var lastTimestampToken = timestampTokenValues.last!
-          // Force nonzero segment length to prevent infinite looping
           if penultimateWasTimestamp {
             lastTimestampToken += 1
           }
-          // Suppress all timestamp tokens from timestampBegin up to (but not including) lastTimestampToken
           let lowerCond = indices .>= Int32(tokenizer.timestampBegin)
           let upperCond = indices .< Int32(lastTimestampToken)
           let rangeCond = MLX.logicalAnd(lowerCond, upperCond)
           timestampMask = MLX.where(rangeCond, MLXArray(-Float.infinity), timestampMask)
         }
 
-        // First generated token MUST be a timestamp (Python lines 370-379)
         if numGenerated == 0 {
-          // Suppress all non-timestamp tokens (indices < timestampBegin)
           timestampMask = MLX.where(
             indices .< Int32(tokenizer.timestampBegin),
             MLXArray(-Float.infinity),
             timestampMask
           )
 
-          // Apply max_initial_timestamp option
           let maxInitialTimestampIndex = 50
           let lastAllowed = tokenizer.timestampBegin + maxInitialTimestampIndex
           if lastAllowed < vocabSize {
-            // Suppress timestamps beyond max initial (indices > lastAllowed)
             timestampMask = MLX.where(
               indices .> Int32(lastAllowed),
               MLXArray(-Float.infinity),
@@ -316,22 +344,13 @@ class GreedyDecoder {
 
       // =============================================================================
       // STEP 3: Apply timestamp probability heuristic (Python lines 381-394)
-      // IMPORTANT: Python uses RAW logits (not filtered) for probability computation
-      // The mask is built separately and applied at the end
       // =============================================================================
       if options.timestamps != .none, numGenerated > 0 {
-        // Python: uses RAW logits for probability computation, not filtered
-        // logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         let logProbs = lastLogits - MLX.logSumExp(lastLogits, axes: [-1], keepDims: true)
-
-        // Compare timestamp vs text token probabilities entirely on GPU.
-        // shouldForce is a shape-[1] bool MLXArray — no CPU sync needed.
         let timestampLogProbSum = MLX.logSumExp(logProbs[tokenizer.timestampBegin...], axes: [-1], keepDims: true)
         let maxTextLogProb = logProbs[0 ..< tokenizer.timestampBegin].max(axes: [-1], keepDims: true)
         let shouldForce = timestampLogProbSum .> maxTextLogProb
 
-        // Merge the forceTimestamp decision directly into timestampMask on GPU.
-        // Broadcasting expands shouldForce [1] → [vocabSize] automatically.
         timestampMask = MLX.where(
           MLX.logicalAnd(shouldForce, indices .< Int32(tokenizer.timestampBegin)),
           MLXArray(-Float.infinity),
@@ -340,38 +359,40 @@ class GreedyDecoder {
       }
 
       // =============================================================================
-      // STEP 4: Combine masks and apply (vectorized min to merge -inf values)
+      // STEP 4: Combine masks and apply
       // =============================================================================
       let finalMask = MLX.minimum(baseMask, timestampMask)
       lastLogits = lastLogits + finalMask
 
-      // Sample next token
-      let nextToken: Int
+      // Sample next token (lazy MLXArray; sync deferred until next iteration or accumulation)
+      let nextTokenLazy: MLXArray
       if options.temperature == 0.0 {
-        // Greedy decoding
-        nextToken = Int(MLX.argMax(lastLogits).item(Int32.self))
+        nextTokenLazy = MLX.argMax(lastLogits, axis: -1)
       } else {
-        // Temperature sampling
         let probs = MLX.softmax(lastLogits / options.temperature, axis: -1)
-        nextToken = sampleFromDistribution(probs)
+        nextTokenLazy = MLXRandom.categorical(MLX.log(probs + 1e-10))
       }
 
-      // Accumulate masked logits and selected token indices for batch logprob computation.
-      // Deferring softmax + log + gather + item() to a single pass after the loop
-      // eliminates one GPU→CPU round trip per non-EOT step.
-      // The avgLogProb metric should only include actual content tokens, not EOT
-      // (matches Python line 274: sum_logprobs += logprobs * (tokens[:, -1] != eot)).
-      if nextToken != tokenizer.eot {
+      // Accumulate for avgLogProb; must sync for token value
+      let nextTokenId = Int(nextTokenLazy.item(Int32.self))
+      if nextTokenId != tokenizer.eot {
         cachedLogits.append(lastLogits)
-        selectedTokenIndices.append(nextToken)
+        selectedTokenIndices.append(nextTokenId)
       }
 
-      // Add token to sequence
-      tokens.append(nextToken)
+      prevTokenLazy = nextTokenLazy
 
-      // Check for end-of-text token
-      if nextToken == tokenizer.eot {
+      // EOT check: we'll append and break at start of next iteration, or exit loop
+      if nextTokenId == tokenizer.eot {
         break
+      }
+    }
+
+    // Append final token when loop exits normally (maxGenerateTokens reached)
+    if let prev = prevTokenLazy {
+      let prevTokenId = Int(prev.item(Int32.self))
+      if prevTokenId != tokenizer.eot {
+        tokens.append(prevTokenId)
       }
     }
 
@@ -419,27 +440,6 @@ class GreedyDecoder {
       temperature: options.temperature,
       compressionRatio: compressionRatio
     )
-  }
-
-  /// Sample from a probability distribution
-  ///
-  /// - Parameter probs: Probability distribution
-  /// - Returns: Sampled index
-  private func sampleFromDistribution(_ probs: MLXArray) -> Int {
-    // Simple categorical sampling
-    let probsArray = probs.asArray(Float.self)
-    let random = Float.random(in: 0 ..< 1)
-
-    var cumsum: Float = 0.0
-    for (i, p) in probsArray.enumerated() {
-      cumsum += p
-      if cumsum >= random {
-        return i
-      }
-    }
-
-    // Fallback to last token (shouldn't happen)
-    return probsArray.count - 1
   }
 }
 
