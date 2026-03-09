@@ -24,8 +24,11 @@ let package = Package(
   dependencies: [
     .package(url: "https://github.com/ml-explore/mlx-swift-lm", branch: "main"),
     .package(url: "https://github.com/ml-explore/mlx-swift", branch: "main"),
-    .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMinor(from: "1.1.0")),
+    // upToNextMajor allows FluidAudio's ≥ 1.1.6 requirement to be resolved
+    .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMajor(from: "1.1.0")),
     .package(url: "https://github.com/DePasqualeOrg/swift-tiktoken", branch: "main"),
+    // Silero VAD (CoreML, ANE-accelerated) for batched transcription segmentation
+    .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.3"),
     // espeak-ng is GPLv3 licensed - only linked when using Kokoro
     // TODO: Switch back to upstream after https://github.com/espeak-ng/espeak-ng/pull/2327 is merged
     .package(url: "https://github.com/DePasqualeOrg/espeak-ng-spm.git", branch: "fix-path-espeak-data-macro"),
@@ -39,6 +42,7 @@ let package = Package(
         .product(name: "MLXFFT", package: "mlx-swift"),
         .product(name: "Transformers", package: "swift-transformers"),
         .product(name: "SwiftTiktoken", package: "swift-tiktoken"),
+        .product(name: "FluidAudio", package: "FluidAudio"),
       ],
       path: "package",
       exclude: ["TTS/Kokoro", "Tests"],
