@@ -160,9 +160,36 @@ class GreedyDecoder {
   let model: WhisperModel
   let tokenizer: WhisperTokenizer
 
+  // Lazily initialised once per decoder instance (fixed per model/tokenizer pair)
+  private var _cachedIndices: MLXArray?
+  private var _cachedBaseMask: MLXArray?
+  private var _cachedBaseMaskFirst: MLXArray?
+
   init(model: WhisperModel, tokenizer: WhisperTokenizer) {
     self.model = model
     self.tokenizer = tokenizer
+  }
+
+  private func ensureMasksCached(vocabSize: Int) {
+    guard _cachedIndices == nil else { return }
+    _cachedIndices = MLXArray.arange(vocabSize)
+
+    var baseIds = tokenizer.nonSpeechTokens()
+    baseIds.append(contentsOf: [
+      tokenizer.transcribe, tokenizer.translate,
+      tokenizer.sot, tokenizer.sotPrev,
+      tokenizer.sotLm, tokenizer.noSpeech,
+    ])
+    var maskValues = [Float](repeating: 0.0, count: vocabSize)
+    for id in baseIds where id < vocabSize { maskValues[id] = -Float.infinity }
+    _cachedBaseMask = MLXArray(maskValues)
+
+    var firstMaskValues = maskValues
+    if let blankTokens = try? tokenizer.encode(" ") {
+      for id in blankTokens where id < vocabSize { firstMaskValues[id] = -Float.infinity }
+    }
+    firstMaskValues[tokenizer.eot] = -Float.infinity
+    _cachedBaseMaskFirst = MLXArray(firstMaskValues)
   }
 
   /// Decode from mel spectrogram (encodes then decodes).
@@ -173,7 +200,7 @@ class GreedyDecoder {
   ///   - options: Decoding options (temperature, prompt, etc.)
   /// - Returns: Decoding result
   func decode(_ mel: MLXArray, options: DecodingOptions) -> DecodingResult {
-    let audioFeatures = model.encode(mel)
+    let audioFeatures = model.compiledEncode(mel)
     eval(audioFeatures)
     return decode(audioFeatures: audioFeatures, options: options)
   }
@@ -182,7 +209,7 @@ class GreedyDecoder {
   /// Reuse audio features across temperature fallbacks to avoid redundant encoder passes.
   ///
   /// - Parameters:
-  ///   - audioFeatures: Output of `model.encode(mel)` (batch=1, n_audio_ctx, n_audio_state)
+  ///   - audioFeatures: Output of `model.compiledEncode(mel)` (batch=1, n_audio_ctx, n_audio_state)
   ///   - options: Decoding options (temperature, prompt, etc.)
   /// - Returns: Decoding result
   func decode(audioFeatures: MLXArray, options: DecodingOptions) -> DecodingResult {
@@ -225,31 +252,14 @@ class GreedyDecoder {
     let initialTokenCount = tokens.count
     let maxGenerateTokens = options.maxTokens - initialTokenCount
 
-    // Pre-compute constant arrays used in every iteration of the decode loop.
-    // Building these inside the loop (the previous approach) allocates ~207 KB
-    // of CPU memory per token step — ~1.2 GB for a typical 34-minute meeting.
-    let vocabSizeForMask: Int = {
-      // Encode a dummy token to get the vocab size from the model
-      // We'll capture the actual vocabSize from the first logits call instead
-      // Use a sentinel; it will be replaced after the first forward pass.
-      0
-    }()
-    _ = vocabSizeForMask  // suppress unused warning; real masks built after first pass
-
     var kvCache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]? = nil
     var noSpeechProb: Float = 0.0
-    var cachedLogits: [MLXArray] = []
-    var selectedTokenIndices: [Int] = []
+    var cachedStepLogProbs: [MLXArray] = []
 
     // O(1) timestamp state tracking (replaces O(n) scan over generated tokens)
     var lastWasTimestamp = false
     var penultimateWasTimestamp = true  // vacuously true: no penultimate token yet
     var lastTimestampTokenValue = 0
-
-    // Masks pre-computed after the first forward pass (need vocabSize from logits)
-    var cachedIndices: MLXArray? = nil
-    var cachedBaseMask: MLXArray? = nil          // without SuppressBlank (iterations > 0)
-    var cachedBaseMaskFirst: MLXArray? = nil     // with SuppressBlank (iteration 0)
 
     for iteration in 0 ..< maxGenerateTokens {
       // Convert tokens to MLXArray
@@ -292,29 +302,9 @@ class GreedyDecoder {
       // =============================================================================
       // STEP 1: Base suppression mask (SuppressBlank + SuppressTokens)
       // =============================================================================
-      if cachedIndices == nil {
-        cachedIndices = MLXArray.arange(vocabSize)
-
-        var baseIds = tokenizer.nonSpeechTokens()
-        baseIds.append(contentsOf: [
-          tokenizer.transcribe, tokenizer.translate,
-          tokenizer.sot, tokenizer.sotPrev,
-          tokenizer.sotLm, tokenizer.noSpeech,
-        ])
-        var maskValues = [Float](repeating: 0.0, count: vocabSize)
-        for id in baseIds where id < vocabSize { maskValues[id] = -Float.infinity }
-        cachedBaseMask = MLXArray(maskValues)
-
-        var firstMaskValues = maskValues
-        if let blankTokens = try? tokenizer.encode(" ") {
-          for id in blankTokens where id < vocabSize { firstMaskValues[id] = -Float.infinity }
-        }
-        firstMaskValues[tokenizer.eot] = -Float.infinity
-        cachedBaseMaskFirst = MLXArray(firstMaskValues)
-      }
-
-      let indices = cachedIndices!
-      let baseMask = iteration == 0 ? cachedBaseMaskFirst! : cachedBaseMask!
+      ensureMasksCached(vocabSize: vocabSize)
+      let indices = _cachedIndices!
+      let baseMask = iteration == 0 ? _cachedBaseMaskFirst! : _cachedBaseMask!
 
       // =============================================================================
       // STEP 2: Build timestamp rules mask (ApplyTimestampRules internal mask)
@@ -367,9 +357,13 @@ class GreedyDecoder {
         noSpeechProb = probs[tokenizer.noSpeech].item(Float.self)
       }
 
+      // Collect lazy log-prob scalar for this step (used for avgLogProb at the end).
+      // lastLogits is the unmasked model output. log(softmax)[i] = logits[i] - logSumExp(logits).
+      // No .item() here — keep lazy to avoid extra GPU sync per token.
       if nextTokenId != tokenizer.eot {
-        cachedLogits.append(lastLogits)
-        selectedTokenIndices.append(nextTokenId)
+        let lse = MLX.logSumExp(lastLogits, axes: [-1])
+        let logProb = MLX.take(lastLogits, MLXArray(Int32(nextTokenId))) - lse
+        cachedStepLogProbs.append(logProb)
       }
 
       tokens.append(nextTokenId)
@@ -390,23 +384,14 @@ class GreedyDecoder {
       }
     }
 
-    // Compute avgLogProb in a single batch pass over all cached logits,
-    // avoiding per-step GPU→CPU round trips.
+    // Compute avgLogProb from lazily accumulated per-step log-probs (avoids 40MB batched softmax).
     let avgLogProb: Float
-    if selectedTokenIndices.isEmpty {
+    if cachedStepLogProbs.isEmpty {
       avgLogProb = 0.0
     } else {
-      let numSteps = selectedTokenIndices.count
-      let stackedLogits = MLX.stacked(cachedLogits, axis: 0)  // [numSteps, vocabSize]
-      let allLogProbs = MLX.log(MLX.softmax(stackedLogits, axis: -1))  // [numSteps, vocabSize]
-      let cachedVocabSize = cachedLogits[0].shape[0]
-      let linearIdxs = (0..<numSteps).map {
-        Int32($0) * Int32(cachedVocabSize) + Int32(selectedTokenIndices[$0])
-      }
-      let selectedLogProbs = MLX.take(allLogProbs.flattened(), MLXArray(linearIdxs))
-      let sumLogProbMlx = selectedLogProbs.sum()
-      eval(sumLogProbMlx)
-      avgLogProb = sumLogProbMlx.item(Float.self) / Float(numSteps)
+      let summed = MLX.stacked(cachedStepLogProbs, axis: 0).sum()
+      eval(summed)
+      avgLogProb = summed.item(Float.self) / Float(cachedStepLogProbs.count)
     }
 
     // Extract only the generated tokens (exclude prompt and SOT sequence)
