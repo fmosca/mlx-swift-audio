@@ -202,6 +202,76 @@ cd ~/Work/mlx-swift-audio/benchmarks
 
 ---
 
+---
+
+## Phase 5: Hybrid Batched Decoding (Offline Path)
+
+**Impact:** 2–4× improvement over sequential (batch_size=4–8)
+**Effort:** High
+**Risk:** Medium (correctness at segment boundaries)
+
+### Problem
+
+The fundamental GPU memory-bandwidth ceiling (~0.060 RTF) applies to single-sequence decoding: each decode step reads 1.5 GB of weights to produce **one** output token. Micro-optimisations cannot overcome this limit without changing the algorithm.
+
+### Solution: Amortise Weight Reads Across a Batch
+
+If B short segments are decoded in parallel, the same weight read produces B tokens — approaching an ideal B× throughput gain. The challenge is ensuring no words are cut at segment boundaries (which would happen with naive fixed-30 s chunking).
+
+**Two-path strategy:**
+
+1. **VAD pre-segmentation** (`WhisperVAD.swift`): energy-based VAD splits audio at natural silence boundaries (≥ 0.5 s gaps, < −40 dBFS). This guarantees segments start and end with silence — no mid-word cuts.
+
+2. **Parallel path (segments ≤ 29 s)**: Short segments are packed into batches of `batchSize` (default 4). A single `model.compiledEncode` call processes `[B, nFrames, nMels]`, and `BatchedGreedyDecoder.decodeBatch` runs the autoregressive loop on all B sequences simultaneously. Because `conditionOnPreviousText = false`, the SOT prefix is identical for every sequence, keeping all KV caches in sync throughout the loop.
+
+3. **Sequential path (segments > 29 s)**: Long segments containing uninterrupted speech fall through to the standard single-sequence decoder (30-second windowed pass). Whisper's intelligent seek is not available in this path, but VAD ensures this case is rare in typical meeting audio.
+
+### Architecture
+
+**New files:**
+- `WhisperVAD.swift`: `energyVAD()` + `findSpeechSegments()` + `SpeechSegment` struct
+
+**Modified files:**
+- `WhisperDecoding.swift`: `BatchedGreedyDecoder` class appended (uses file-private compiled functions)
+- `WhisperSTT.swift`: `transcribeBatched()` method
+
+**Key design decisions:**
+- `BatchedGreedyDecoder` lives in the same file as `GreedyDecoder` to share file-private compiled GPU kernels (`compiledTimestampRules`, `compiledTimestampForce`, `compiledArgmax`, `compiledApplyMask`).
+- One GPU forward pass per iteration for all B sequences; one `eval()` sync for `[B, vocab_size]` logits; then B cheap CPU mask operations.
+- Per-sequence O(1) timestamp state tracking (identical logic to `GreedyDecoder`).
+- Temperature fallback is NOT performed in the batched path — caller is responsible for quality filtering. This avoids the complexity of restarting individual sequences within a batch.
+- The VAD pre-pass adds < 1 ms overhead for typical meeting audio.
+
+### Usage
+
+```swift
+let result = await stt.transcribeBatched(
+    audio: audio,
+    language: "en",
+    task: .transcribe,
+    temperature: 0.0,
+    timestamps: .segment,
+    batchSize: 4        // tune: 4 for turbo-q4, 8 if VRAM allows
+)
+```
+
+### Expected Performance
+
+With batch_size=4 on `large-v3-turbo-q4` and clean meeting audio (VAD produces mostly short segments):
+- Sequential RTF: ~0.060
+- Batched RTF target: ~0.020–0.030 (2–3×)
+- Batched RTF max theoretical: 0.060 / 4 = 0.015
+
+Actual gain depends on the fraction of audio in short vs. long segments and the per-step mask overhead.
+
+### Limitations / Future Work
+
+- Temperature fallback per batch element (retry failed sequences individually)
+- Silero VAD or Apple Speech framework VAD for higher accuracy in noisy audio
+- `compiledEncode` retrace penalty on first batch: the compiled encoder retraces for `[B, nFrames, nMels]` vs. `[1, nFrames, nMels]`. After the first batch call the new shape is cached.
+
+---
+
 ## Not Feasible
 
 ### Encode Once and Slice
