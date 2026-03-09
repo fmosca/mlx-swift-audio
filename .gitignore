@@ -70,3 +70,6 @@ swift/Swift-TTS/Swift-TTS/Orpheus/Resources/orpheus-3b-0.1-ft-4bit.safetensors
 CLAUDE.local.md
 .xcodebuild/
 *.profraw
+
+# Benchmark results (ephemeral run data)
+benchmarks/results/*.json
