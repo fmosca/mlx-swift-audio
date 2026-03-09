@@ -150,9 +150,9 @@ class GreedyDecoder {
 
     // Autoregressive decoding
     var kvCache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]? = nil
-    var sumLogProb: Float = 0.0
-    var tokenCount = 0
     var noSpeechProb: Float = 0.0
+    var cachedLogits: [MLXArray] = []
+    var selectedTokenIndices: [Int] = []
 
     // Masks pre-computed after the first forward pass (need vocabSize from logits)
     var cachedIndices: MLXArray? = nil
@@ -319,26 +319,21 @@ class GreedyDecoder {
       // IMPORTANT: Python uses RAW logits (not filtered) for probability computation
       // The mask is built separately and applied at the end
       // =============================================================================
-      var forceTimestamp = false
       if options.timestamps != .none, numGenerated > 0 {
         // Python: uses RAW logits for probability computation, not filtered
         // logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         let logProbs = lastLogits - MLX.logSumExp(lastLogits, axes: [-1], keepDims: true)
 
-        // Compare timestamp vs text token probabilities
-        // Python uses logsumexp (combined probability of all timestamps) vs max text token
+        // Compare timestamp vs text token probabilities entirely on GPU.
+        // shouldForce is a shape-[1] bool MLXArray — no CPU sync needed.
         let timestampLogProbSum = MLX.logSumExp(logProbs[tokenizer.timestampBegin...], axes: [-1], keepDims: true)
         let maxTextLogProb = logProbs[0 ..< tokenizer.timestampBegin].max(axes: [-1], keepDims: true)
+        let shouldForce = timestampLogProbSum .> maxTextLogProb
 
-        if timestampLogProbSum.item(Float.self) > maxTextLogProb.item(Float.self) {
-          forceTimestamp = true
-        }
-      }
-
-      // If forcing timestamp, suppress all text tokens in timestamp mask
-      if forceTimestamp {
+        // Merge the forceTimestamp decision directly into timestampMask on GPU.
+        // Broadcasting expands shouldForce [1] → [vocabSize] automatically.
         timestampMask = MLX.where(
-          indices .< Int32(tokenizer.timestampBegin),
+          MLX.logicalAnd(shouldForce, indices .< Int32(tokenizer.timestampBegin)),
           MLXArray(-Float.infinity),
           timestampMask
         )
@@ -361,15 +356,14 @@ class GreedyDecoder {
         nextToken = sampleFromDistribution(probs)
       }
 
-      // Track log probability (skip EOT tokens to match Python line 274:
-      // sum_logprobs += current_logprobs * (tokens[:, -1] != self.eot))
-      // The avgLogProb metric should only include actual content tokens, not EOT.
-      // Including EOT skews the metric and causes incorrect temperature fallback decisions.
+      // Accumulate masked logits and selected token indices for batch logprob computation.
+      // Deferring softmax + log + gather + item() to a single pass after the loop
+      // eliminates one GPU→CPU round trip per non-EOT step.
+      // The avgLogProb metric should only include actual content tokens, not EOT
+      // (matches Python line 274: sum_logprobs += logprobs * (tokens[:, -1] != eot)).
       if nextToken != tokenizer.eot {
-        let logProbs = MLX.log(MLX.softmax(lastLogits, axis: -1))
-        let logProb = logProbs[nextToken].item(Float.self)
-        sumLogProb += logProb
-        tokenCount += 1
+        cachedLogits.append(lastLogits)
+        selectedTokenIndices.append(nextToken)
       }
 
       // Add token to sequence
@@ -381,8 +375,24 @@ class GreedyDecoder {
       }
     }
 
-    // Compute statistics
-    let avgLogProb = tokenCount > 0 ? sumLogProb / Float(tokenCount) : 0.0
+    // Compute avgLogProb in a single batch pass over all cached logits,
+    // avoiding per-step GPU→CPU round trips.
+    let avgLogProb: Float
+    if selectedTokenIndices.isEmpty {
+      avgLogProb = 0.0
+    } else {
+      let numSteps = selectedTokenIndices.count
+      let stackedLogits = MLX.stacked(cachedLogits, axis: 0)  // [numSteps, vocabSize]
+      let allLogProbs = MLX.log(MLX.softmax(stackedLogits, axis: -1))  // [numSteps, vocabSize]
+      let cachedVocabSize = cachedLogits[0].shape[0]
+      let linearIdxs = (0..<numSteps).map {
+        Int32($0) * Int32(cachedVocabSize) + Int32(selectedTokenIndices[$0])
+      }
+      let selectedLogProbs = MLX.take(allLogProbs.flattened(), MLXArray(linearIdxs))
+      let sumLogProbMlx = selectedLogProbs.sum()
+      eval(sumLogProbMlx)
+      avgLogProb = sumLogProbMlx.item(Float.self) / Float(numSteps)
+    }
 
     // Extract only the generated tokens (exclude prompt and SOT sequence)
     // This matches Python's behavior where result.tokens only contains generated tokens
