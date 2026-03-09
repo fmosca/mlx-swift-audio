@@ -8,27 +8,23 @@ meeting audio).
 
 ---
 
-## Current Measurement Results (as of this session)
+## Measurement Results (clean GPU, sequential runs)
 
-All measurements on Apple Silicon (M-series), audio: `benchmarks/fixtures/ami_ES2002a_full.wav`.
+All measurements on Apple Silicon (M-series), audio: `benchmarks/fixtures/ami_ES2002a_full.wav`,
+3 benchmark runs each with warmup, GPU uncontested.
 
-| Engine | RTF (avg) | RTF (min) | Notes |
-|--------|-----------|-----------|-------|
-| Python mlx-whisper | 0.0696 | — | Two fresh runs, models cached |
-| Swift (this repo) | 0.0627 | 0.0562 | Average of 3 runs per benchmark |
+| Engine | RTF (avg) | RTF (min) | RTF (max) |
+|--------|-----------|-----------|-----------|
+| Python mlx-whisper | 0.0597 | 0.0584 | 0.0605 |
+| Swift (all optimisations) | 0.0616 | 0.0594 | 0.0643 |
 
-**Swift is ~10% faster than Python** under equivalent conditions. The stored hardcoded baseline of
-`0.0500` in `benchmarks/benchmark.py` and `benchmarks/cli/WhisperBenchmarkCLI.swift` is stale —
-it was measured during an earlier session under a less-loaded system.
+**Swift is within ~3% of Python** — essentially at parity. The measurement distributions overlap;
+no statistically significant difference.
 
-### Why the 0.0500 baseline is unreliable
+The stored hardcoded baseline of `0.0500` in both benchmark scripts is stale (measured during an
+earlier session under low system load). Under an uncontested GPU, Python's actual RTF is ~0.060.
 
-- Both benchmarks show high variance (Swift: 0.0562–0.0734, Python: 0.0690–0.0702)
-- The machine was partially busy during benchmarking (Chrome + GPU contention)
-- The stored 0.0500 was a single historical measurement under ideal conditions
-
-**Action required**: Update both benchmark scripts to measure the Python RTF dynamically instead
-of comparing against the hardcoded 0.0500.
+**Action required**: Update both benchmark scripts to measure Python RTF dynamically.
 
 ---
 
@@ -149,10 +145,75 @@ the typed 3-argument `compile { (a, b, c) -> T in ... }` form and works correctl
 
 ---
 
+## Session 2: Additional Optimizations (no net RTF change)
+
+Three further optimizations were implemented but produced no measurable RTF improvement (within
+benchmark variance):
+
+### Iterative log-probability accumulation
+
+Replaced the end-of-segment approach that stacked [numSteps, vocabSize] (~40MB) into a GPU
+softmax, with per-step lazy scalars `logit[token] - logSumExp(logits)`. The large allocation is
+gone but the benchmark RTF is statistically unchanged — the GPU memory pressure reduction doesn't
+affect throughput because the forward pass is memory-bandwidth bound, not allocation-limited.
+
+### Decoder-level mask caching
+
+Promoted `cachedIndices`, `cachedBaseMask`, `cachedBaseMaskFirst` to instance properties of
+`GreedyDecoder` (built once per decoder lifetime rather than per decode call). Saves CPU work on
+temperature-fallback retries, but temperature fallbacks are rare and mask building was fast (~1ms),
+so the effect is negligible.
+
+### Compiled encoder
+
+Wrapped `model.encoder` in `compile()`. The encoder receives fixed shape [1, 3000, nMels] and the
+compiled graph is reused for all ~42 segments. First call traces; subsequent calls should reuse
+the fused kernel. No measurable RTF benefit — the encoder represents a small fraction of total
+decode time and MLX's per-op lazy graph was already efficient.
+
+**Root diagnosis**: All these optimizations target overheads that are not the bottleneck. The
+transformer forward pass (attention + FFN across 24 layers) is fully GPU memory-bandwidth bound on
+Apple Silicon. Neither compilation tricks nor CPU-side improvements can exceed this hardware ceiling.
+
+---
+
+## Why 30% Faster Requires a Different Algorithm
+
+### The hardware ceiling
+
+Both Swift and Python execute identical MLX operations. Both arrive at ~0.060 RTF on the same
+hardware. Python's `@mx.compile` on the full decode step provides no measurable advantage because:
+1. The per-op dispatch overhead is already minimal in MLX's C++ runtime
+2. Kernel fusion across attention layers provides marginal benefit when memory bandwidth is the
+   limiting factor
+3. The quantized weight dequantization and matrix multiplication dominate — these are already
+   highly optimised Metal kernels
+
+### What would actually give 30%+ speedup
+
+1. **Speculative decoding** (most viable): Use whisper-tiny or whisper-small as a draft model to
+   speculatively generate K tokens, verify with the large model. Acceptance rate ~70-80% expected
+   for English meeting audio. Theoretical speedup: 2-3x at high acceptance rates.
+   - Implementation: add `SpeculativeDecoder` wrapper that manages two model instances
+   - Complexity: high; requires model compatibility checks and fallback logic
+
+2. **Static KV cache (pre-allocated)**: Pre-allocate self-attention KV buffers to `maxTokens` size
+   at decode start. This makes all KV shapes fixed across steps, enabling `compile(shapeless: false)`
+   on the full decode step (tokens → logits → next token, with cache update). Requires rewriting
+   the attention layer's cache management.
+   - Complexity: medium-high; needs attention code changes and positional masking
+   - Benefit: allows full-step compilation → reduces per-step overhead
+
+3. **Batched encoding** (limited benefit): Process multiple 30-second windows through the encoder
+   simultaneously. Benefit is capped by the encoder's share of total time (~15-20%) and requires
+   disabling `conditionOnPreviousText`.
+
+4. **distil-whisper** or quantized smaller model: 3-5x faster with some quality trade-off.
+
 ## Remaining Gap and Why
 
-Swift is ~10% faster than Python under current measurement conditions. The target of 30% faster
-remains unmet. The most significant remaining opportunity:
+Swift is at parity with Python (~0% difference). The target of 30% faster Python remains unmet.
+The most significant remaining opportunity:
 
 ### Python `@mx.compile` on the full decode step
 
