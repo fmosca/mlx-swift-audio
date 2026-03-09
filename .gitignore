@@ -68,3 +68,5 @@ swift/Swift-TTS/Swift-TTS/Orpheus/Resources/orpheus-3b-0.1-ft-4bit.safetensors
 
 # Agents
 CLAUDE.local.md
+.xcodebuild/
+*.profraw

@@ -15,6 +15,11 @@ let package = Package(
       name: "Kokoro",
       targets: ["Kokoro"],
     ),
+    // Benchmark CLI for performance testing
+    .executable(
+      name: "WhisperBenchmark",
+      targets: ["WhisperBenchmark"],
+    ),
   ],
   dependencies: [
     .package(url: "https://github.com/ml-explore/mlx-swift-lm", branch: "main"),
@@ -54,6 +59,11 @@ let package = Package(
       name: "MLXAudioTests",
       dependencies: ["MLXAudio"],
       path: "package/Tests",
+    ),
+    .executableTarget(
+      name: "WhisperBenchmark",
+      dependencies: ["MLXAudio"],
+      path: "benchmarks/cli",
     ),
   ],
 )

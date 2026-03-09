@@ -200,7 +200,8 @@ class GreedyDecoder {
       let tokensToProcess: MLXArray
       if let prev = prevTokenLazy {
         // Pipelined: use lazy token from previous iteration (no sync yet)
-        tokensToProcess = prev.expandedDimensions(axis: 0)
+        // prev is scalar [], need [1, 1] for decoder (batch=1, seq_len=1)
+        tokensToProcess = prev.expandedDimensions(axis: 0).expandedDimensions(axis: 0)
       } else {
         // First iteration: pass all initial tokens (SOT sequence)
         tokensToProcess = MLXArray(tokens.map { Int32($0) }).expandedDimensions(axis: 0)
