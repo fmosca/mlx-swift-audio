@@ -74,20 +74,79 @@ struct DecodingResult {
   let compressionRatio: Float
 }
 
-// MARK: - Cache Flattening for asyncEval
+// MARK: - Compiled Hot Paths
 
-/// Flatten Whisper KV cache into [MLXArray] for asyncEval.
-/// asyncEval's collect() does not handle Optional, so we flatten manually.
-private func flattenWhisperCache(
-  _ cache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]?
-) -> [MLXArray] {
-  guard let cache = cache else { return [] }
-  var result: [MLXArray] = []
-  for layer in cache {
-    if let sa = layer.0 { result.append(contentsOf: [sa.0, sa.1]) }
-    if let ca = layer.1 { result.append(contentsOf: [ca.0, ca.1]) }
+/// Compiled greedy sampling: argmax over vocab dimension
+private let compiledArgmax = compile { (logits: MLXArray) -> MLXArray in
+  MLX.argMax(logits, axis: -1)
+}
+
+/// Timestamp suppression rules compiled into a GPU kernel. (Step 2 of the decode loop).
+/// Packs boolean and integer state into two MLXArray vectors to stay within
+/// compile()'s 3-argument typed form.
+///
+/// boolState: [lastWasTimestamp, penultimateWasTimestamp] as Int32 (0 or 1)
+/// intState:  [lastTsVal, numGenerated, tsBegin, noTimestamps, eot] as Int32
+private nonisolated(unsafe) let compiledTimestampRules: (MLXArray, MLXArray, MLXArray) -> MLXArray =
+  compile { (indices: MLXArray, boolState: MLXArray, intState: MLXArray) -> MLXArray in
+    let lastWasTs = boolState[0]
+    let penultimateWasTs = boolState[1]
+    let lastTsVal = intState[0]
+    let numGen = intState[1]
+    let tsBegin = intState[2]
+    let noTs = intState[3]
+    let eot = intState[4]
+
+    let negInf = MLXArray(-Float.infinity)
+    let one = MLXArray(Int32(1))
+    let zero = MLXArray(Int32(0))
+    let zeros = MLXArray.zeros(indices.shape)
+
+    var mask = MLX.where(indices .== noTs, negInf, zeros)
+
+    let whenPenultTs = MLX.where(indices .>= tsBegin, negInf, zeros)
+    let whenPenultText = MLX.where(indices .< eot, negInf, zeros)
+    let tsRule = MLX.where(penultimateWasTs .== one, whenPenultTs, whenPenultText)
+    mask = mask + MLX.where(lastWasTs .== one, tsRule, zeros)
+
+    let monoRule = MLX.where(
+      MLX.logicalAnd(indices .>= tsBegin, indices .< lastTsVal), negInf, zeros)
+    mask = mask + MLX.where(lastTsVal .> tsBegin, monoRule, zeros)
+
+    let textSuppress = MLX.where(indices .< tsBegin, negInf, zeros)
+    let maxInitTs = tsBegin + MLXArray(Int32(50))
+    let distantTsSuppress = MLX.where(indices .> maxInitTs, negInf, zeros)
+    mask = mask + MLX.where(numGen .== zero, textSuppress + distantTsSuppress, zeros)
+
+    return mask
   }
-  return result
+
+/// Compiled mask application: add -inf mask to logits
+private let compiledApplyMask = compile { (logits: MLXArray, mask: MLXArray) -> MLXArray in
+  logits + mask
+}
+
+/// Compiled timestamp probability heuristic.
+/// Returns a [vocab_size] mask: -inf for text tokens when timestamps should be forced.
+/// timestampBeginScalar: MLXArray scalar (e.g. MLXArray(Int32(tokenizer.timestampBegin)))
+private nonisolated(unsafe) let compiledTimestampForce = compile {
+  (logits: MLXArray, indices: MLXArray, timestampBeginScalar: MLXArray) -> MLXArray in
+  let logProbs = logits - MLX.logSumExp(logits, axes: [-1], keepDims: true)
+  let maskTs = indices .>= timestampBeginScalar
+  let maskText = indices .< timestampBeginScalar
+  let timestampLogProbSum = MLX.logSumExp(
+    MLX.where(maskTs, logProbs, MLXArray(-Float.infinity)),
+    axes: [-1],
+    keepDims: true
+  )
+  let maxTextLogProb = MLX.where(maskText, logProbs, MLXArray(-Float.infinity))
+    .max(axes: [-1], keepDims: true)
+  let shouldForce = timestampLogProbSum .> maxTextLogProb
+  return MLX.where(
+    MLX.logicalAnd(shouldForce, indices .< timestampBeginScalar),
+    MLXArray(-Float.infinity),
+    MLXArray.zeros(indices.shape)
+  )
 }
 
 // MARK: - Greedy Decoder
@@ -177,31 +236,29 @@ class GreedyDecoder {
     }()
     _ = vocabSizeForMask  // suppress unused warning; real masks built after first pass
 
-    // Autoregressive decoding with async eval pipelining.
-    // Pattern: overlap GPU compute (iteration N) with CPU sync for token (iteration N-1).
-    // See FunASR/FunASRSTT.swift and T3Turbo.swift for reference.
     var kvCache: [((MLXArray, MLXArray)?, (MLXArray, MLXArray)?)]? = nil
     var noSpeechProb: Float = 0.0
     var cachedLogits: [MLXArray] = []
     var selectedTokenIndices: [Int] = []
+
+    // O(1) timestamp state tracking (replaces O(n) scan over generated tokens)
+    var lastWasTimestamp = false
+    var penultimateWasTimestamp = true  // vacuously true: no penultimate token yet
+    var lastTimestampTokenValue = 0
 
     // Masks pre-computed after the first forward pass (need vocabSize from logits)
     var cachedIndices: MLXArray? = nil
     var cachedBaseMask: MLXArray? = nil          // without SuppressBlank (iterations > 0)
     var cachedBaseMaskFirst: MLXArray? = nil     // with SuppressBlank (iteration 0)
 
-    // Lazy token from previous iteration; we sync for it at start of next iteration
-    // after kicking off the forward pass (async pipelining).
-    var prevTokenLazy: MLXArray? = nil
-
     for iteration in 0 ..< maxGenerateTokens {
       // Convert tokens to MLXArray
       // With KV caching: only pass new token(s), not all tokens
       let tokensToProcess: MLXArray
-      if let prev = prevTokenLazy {
-        // Pipelined: use lazy token from previous iteration (no sync yet)
-        // prev is scalar [], need [1, 1] for decoder (batch=1, seq_len=1)
-        tokensToProcess = prev.expandedDimensions(axis: 0).expandedDimensions(axis: 0)
+      if kvCache != nil {
+        // Subsequent iterations: pass only the last token
+        let lastToken = tokens.last!
+        tokensToProcess = MLXArray(Int32(lastToken)).expandedDimensions(axis: 0).expandedDimensions(axis: 0)
       } else {
         // First iteration: pass all initial tokens (SOT sequence)
         tokensToProcess = MLXArray(tokens.map { Int32($0) }).expandedDimensions(axis: 0)
@@ -214,34 +271,16 @@ class GreedyDecoder {
         kvCache: kvCache
       )
 
-      // Iteration 0: must sync for noSpeechProb and mask building.
-      // Iteration >= 1: asyncEval to overlap GPU compute with CPU sync for prev token.
-      if iteration == 0 {
-        eval(logits)
-      } else {
-        var toEval: [MLXArray] = [logits]
-        toEval.append(contentsOf: flattenWhisperCache(newCache))
-        asyncEval(toEval)
-      }
-
-      // Sync for previous token (iteration >= 1). GPU is already computing current step.
-      if let prev = prevTokenLazy {
-        let prevTokenId = Int(prev.item(Int32.self))
-        tokens.append(prevTokenId)
-        if prevTokenId == tokenizer.eot {
-          break
-        }
-      }
+      // asyncEval lets GPU run the forward pass while CPU builds masks below.
+      // noSpeechProb uses lazy ops (no early sync needed; syncs with argmax below).
+      asyncEval(logits)
 
       // Update KV cache
       kvCache = newCache
 
-      // Compute no-speech probability from first forward pass
-      if iteration == 0 {
-        let sotLogits = logits[0, sotIndex]
-        let probs = MLX.softmax(sotLogits, axis: -1)
-        noSpeechProb = probs[tokenizer.noSpeech].item(Float.self)
-      }
+      // Lazily capture no-speech logit for iteration 0; the actual .item() sync
+      // happens on noSpeechProb AFTER the argmax sync, so no extra GPU sync is added.
+      let sotLogitsLazy: MLXArray? = iteration == 0 ? logits[0, sotIndex] : nil
 
       // Get logits for last token
       var lastLogits = logits[0, -1]
@@ -254,7 +293,7 @@ class GreedyDecoder {
       // STEP 1: Base suppression mask (SuppressBlank + SuppressTokens)
       // =============================================================================
       if cachedIndices == nil {
-        cachedIndices = MLXArray(Int32(0) ..< Int32(vocabSize))
+        cachedIndices = MLXArray.arange(vocabSize)
 
         var baseIds = tokenizer.nonSpeechTokens()
         baseIds.append(contentsOf: [
@@ -281,119 +320,73 @@ class GreedyDecoder {
       // STEP 2: Build timestamp rules mask (ApplyTimestampRules internal mask)
       // =============================================================================
       var timestampMask = MLXArray.zeros([vocabSize])
-
       if options.timestamps != .none {
-        timestampMask = MLX.where(
-          indices .== Int32(tokenizer.noTimestamps),
-          MLXArray(-Float.infinity),
-          timestampMask
-        )
-
-        let lastWasTimestamp = numGenerated >= 1 && tokens.last! >= tokenizer.timestampBegin
-        let penultimateWasTimestamp = numGenerated < 2 || tokens[tokens.count - 2] >= tokenizer.timestampBegin
-
-        if lastWasTimestamp {
-          if penultimateWasTimestamp {
-            timestampMask = MLX.where(
-              indices .>= Int32(tokenizer.timestampBegin),
-              MLXArray(-Float.infinity),
-              timestampMask
-            )
-          } else {
-            timestampMask = MLX.where(
-              indices .< Int32(tokenizer.eot),
-              MLXArray(-Float.infinity),
-              timestampMask
-            )
-          }
-        }
-
-        let generatedTokens = tokens.suffix(numGenerated)
-        let timestampTokenValues = generatedTokens.compactMap { token -> Int? in
-          token > tokenizer.timestampBegin ? token : nil
-        }
-
-        if !timestampTokenValues.isEmpty {
-          var lastTimestampToken = timestampTokenValues.last!
-          if penultimateWasTimestamp {
-            lastTimestampToken += 1
-          }
-          let lowerCond = indices .>= Int32(tokenizer.timestampBegin)
-          let upperCond = indices .< Int32(lastTimestampToken)
-          let rangeCond = MLX.logicalAnd(lowerCond, upperCond)
-          timestampMask = MLX.where(rangeCond, MLXArray(-Float.infinity), timestampMask)
-        }
-
-        if numGenerated == 0 {
-          timestampMask = MLX.where(
-            indices .< Int32(tokenizer.timestampBegin),
-            MLXArray(-Float.infinity),
-            timestampMask
-          )
-
-          let maxInitialTimestampIndex = 50
-          let lastAllowed = tokenizer.timestampBegin + maxInitialTimestampIndex
-          if lastAllowed < vocabSize {
-            timestampMask = MLX.where(
-              indices .> Int32(lastAllowed),
-              MLXArray(-Float.infinity),
-              timestampMask
-            )
-          }
-        }
+        let boolState = MLXArray([
+          Int32(lastWasTimestamp ? 1 : 0),
+          Int32(penultimateWasTimestamp ? 1 : 0),
+        ])
+        let intState = MLXArray([
+          Int32(lastTimestampTokenValue),
+          Int32(numGenerated),
+          Int32(tokenizer.timestampBegin),
+          Int32(tokenizer.noTimestamps),
+          Int32(tokenizer.eot),
+        ])
+        timestampMask = compiledTimestampRules(indices, boolState, intState)
       }
 
       // =============================================================================
       // STEP 3: Apply timestamp probability heuristic (Python lines 381-394)
       // =============================================================================
       if options.timestamps != .none, numGenerated > 0 {
-        let logProbs = lastLogits - MLX.logSumExp(lastLogits, axes: [-1], keepDims: true)
-        let timestampLogProbSum = MLX.logSumExp(logProbs[tokenizer.timestampBegin...], axes: [-1], keepDims: true)
-        let maxTextLogProb = logProbs[0 ..< tokenizer.timestampBegin].max(axes: [-1], keepDims: true)
-        let shouldForce = timestampLogProbSum .> maxTextLogProb
-
-        timestampMask = MLX.where(
-          MLX.logicalAnd(shouldForce, indices .< Int32(tokenizer.timestampBegin)),
-          MLXArray(-Float.infinity),
-          timestampMask
-        )
+        let timestampBeginScalar = MLXArray(Int32(tokenizer.timestampBegin))
+        let probHeuristicMask = compiledTimestampForce(lastLogits, indices, timestampBeginScalar)
+        timestampMask = MLX.minimum(timestampMask, probHeuristicMask)
       }
 
       // =============================================================================
       // STEP 4: Combine masks and apply
       // =============================================================================
       let finalMask = MLX.minimum(baseMask, timestampMask)
-      lastLogits = lastLogits + finalMask
+      let maskedLogits = compiledApplyMask(lastLogits, finalMask)
 
-      // Sample next token (lazy MLXArray; sync deferred until next iteration or accumulation)
-      let nextTokenLazy: MLXArray
+      // Sample next token (the .item() call here is the primary GPU sync for this iteration)
+      let nextTokenId: Int
       if options.temperature == 0.0 {
-        nextTokenLazy = MLX.argMax(lastLogits, axis: -1)
+        let nextTokenArray = compiledArgmax(maskedLogits)
+        nextTokenId = Int(nextTokenArray.item(Int32.self))
       } else {
-        let probs = MLX.softmax(lastLogits / options.temperature, axis: -1)
-        nextTokenLazy = MLXRandom.categorical(MLX.log(probs + 1e-10))
+        let probs = MLX.softmax(maskedLogits / options.temperature, axis: -1)
+        let nextTokenArray = MLXRandom.categorical(MLX.log(probs + 1e-10))
+        nextTokenId = Int(nextTokenArray.item(Int32.self))
       }
 
-      // Accumulate for avgLogProb; must sync for token value
-      let nextTokenId = Int(nextTokenLazy.item(Int32.self))
+      // Extract no-speech probability after the GPU sync (sotLogitsLazy is already evaluated)
+      if let sotLogits = sotLogitsLazy {
+        let probs = MLX.softmax(sotLogits, axis: -1)
+        noSpeechProb = probs[tokenizer.noSpeech].item(Float.self)
+      }
+
       if nextTokenId != tokenizer.eot {
         cachedLogits.append(lastLogits)
         selectedTokenIndices.append(nextTokenId)
       }
 
-      prevTokenLazy = nextTokenLazy
+      tokens.append(nextTokenId)
 
-      // EOT check: we'll append and break at start of next iteration, or exit loop
       if nextTokenId == tokenizer.eot {
         break
       }
-    }
 
-    // Append final token when loop exits normally (maxGenerateTokens reached)
-    if let prev = prevTokenLazy {
-      let prevTokenId = Int(prev.item(Int32.self))
-      if prevTokenId != tokenizer.eot {
-        tokens.append(prevTokenId)
+      // Update O(1) timestamp tracking for the next iteration.
+      // penultimateWasTimestamp mirrors original: numGenerated < 2 OR second-to-last was timestamp.
+      // For iteration 0 (one token generated), penultimate is vacuously true (numGenerated+1 = 1 < 2).
+      // For iteration 1+, penultimate = what lastWasTimestamp was before this token.
+      penultimateWasTimestamp = (numGenerated == 0) ? true : lastWasTimestamp
+      lastWasTimestamp = nextTokenId >= tokenizer.timestampBegin
+      if lastWasTimestamp {
+        lastTimestampTokenValue = nextTokenId
+        if penultimateWasTimestamp { lastTimestampTokenValue += 1 }
       }
     }
 
