@@ -8,23 +8,36 @@ meeting audio).
 
 ---
 
-## Measurement Results (clean GPU, sequential runs)
+## Current State (after Session 3)
 
-All measurements on Apple Silicon (M-series), audio: `benchmarks/fixtures/ami_ES2002a_full.wav`,
-3 benchmark runs each with warmup, GPU uncontested.
+All measurements: Apple Silicon M1 Pro, `mlx-community/whisper-large-v3-turbo-q4`,
+`benchmarks/fixtures/ami_ES2002a_5min.wav` (5-min AMI corpus clip), GPU uncontested.
+Python settings: `word_timestamps=True`, `condition_on_previous_text=False`.
+
+| Engine | Mode | RTF | Word Jaccard | Start MAE |
+|--------|------|-----|--------------|-----------|
+| Python mlx-whisper | sequential | 0.0596 | 1.0 (ref) | — |
+| Swift batched B=4 | no word timestamps | 0.0551 | — | — |
+| Swift batched B=4 | with word timestamps | **0.0538** | 0.736 | 73 ms |
+
+**Swift batched is 10% faster than Python** with full word-level timestamps.
+
+---
+
+## Session 1–2 Results (sequential decoder, no word timestamps)
+
+Audio: `ami_ES2002a_full.wav` (21 min), 3 runs each with warmup.
 
 | Engine | RTF (avg) | RTF (min) | RTF (max) |
 |--------|-----------|-----------|-----------|
 | Python mlx-whisper | 0.0597 | 0.0584 | 0.0605 |
-| Swift (all optimisations) | 0.0616 | 0.0594 | 0.0643 |
+| Swift sequential (all optimisations) | 0.0616 | 0.0594 | 0.0643 |
 
-**Swift is within ~3% of Python** — essentially at parity. The measurement distributions overlap;
-no statistically significant difference.
+Swift sequential is within ~3% of Python — at parity. The architectural ceiling
+(GPU memory-bandwidth bound) prevents further gains on the single-sequence path.
 
-The stored hardcoded baseline of `0.0500` in both benchmark scripts is stale (measured during an
-earlier session under low system load). Under an uncontested GPU, Python's actual RTF is ~0.060.
-
-**Action required**: Update both benchmark scripts to measure Python RTF dynamically.
+Note: the stored hardcoded baseline of `0.0500` in earlier benchmark scripts was
+stale (measured under low system load). Actual Python RTF under uncontested GPU is ~0.060.
 
 ---
 
@@ -177,7 +190,71 @@ Apple Silicon. Neither compilation tricks nor CPU-side improvements can exceed t
 
 ---
 
-## Why 30% Faster Requires a Different Algorithm
+---
+
+## Session 3: Hybrid Batched Decoding (Phase 5 + 6)
+
+### Goal achieved
+
+The single-sequence decoder is hardware-ceiling-bound at ~0.060 RTF. To go faster requires
+amortising the GPU weight-read cost across multiple sequences — batching.
+
+### Architecture
+
+**VAD + Segment merging**
+- Silero VAD via FluidAudio (CoreML, ANE-accelerated) replaces the earlier energy-based
+  prototype. Segments are merged greedily up to 29 s to maximise Whisper's context window.
+- Typical meeting audio: median merged segment ~10–15 s, producing ~15–25 batch slots for
+  a 5-minute clip.
+
+**BatchedGreedyDecoder** (`WhisperDecoding.swift`)
+- Runs the autoregressive loop on B sequences simultaneously; one GPU forward pass per step
+  over stacked `[B, n_ctx, n_state]` features.
+- `timestamps: .none` in the batched path — VAD provides boundaries; removing Whisper's
+  internal timestamp tokens eliminates per-step timestamp rules + forcing heuristic GPU work
+  (~10% RTF reduction).
+- Shares file-private compiled kernels with `GreedyDecoder`.
+
+**Inter-batch conditioning**
+- `decodeBatch` accepts `options.prompt`, prepending `<|startofprev|>` + prompt tokens
+  (same logic as `GreedyDecoder.decode`). `transcribeBatched` carries the last batch's
+  tokens forward as context — approximates `condition_on_previous_text` while preserving
+  within-batch parallelism. Effect: Jaccard 0.630 → 0.718.
+
+**Word timestamps**
+- `addWordTimestamps` / `findAlignment` accept `audioFeatures: MLXArray?`. When provided
+  (from the same encode step that powered decoding), the DTW alignment pass calls
+  `model.decodeWithCrossQK(audioFeatures, tokens:)` — decoder-only, no re-encode.
+  This eliminated the +67% RTF overhead that word timestamps originally imposed.
+
+**Quality gates** (from faster-whisper / WhisperX research)
+
+| Gate | Where | Effect |
+|---|---|---|
+| Compression ratio > 2.4 | `shouldAccept` post-decode | Drops repetitive segments |
+| `noRepeatNgramSize = 3` | `BatchedGreedyDecoder` per step | Prevents n-gram repeats during generation |
+| `hallucinationSilenceThreshold = 2.0 s` | Post-word-timestamp | Drops segments with >2 s inter-word gap |
+
+Combined effect: word count 429 → 391 (Python: 408); Jaccard 0.630 → 0.736.
+
+### Benchmark tooling added
+
+- `benchmarks/scripts/word_baseline.py`: Python word-level JSON baseline
+  (`condition_on_previous_text=False` for fair comparison)
+- `word-compare` CLI mode: one-to-one word matching (±1.5 s window), MAE, p90, signed bias
+
+### Remaining gap
+
+Word Jaccard 0.736 vs Python 1.0. Residual causes:
+1. Within a batch, all segments share the previous batch's prompt — earlier segments in the
+   batch have slightly weaker context than a fully sequential decoder would give them.
+2. The WhisperX approach (dedicated wav2vec2/MMS forced-aligner replacing cross-attention DTW)
+   would give sub-50 ms alignment but requires a CoreML-compatible forced aligner — none
+   currently exists for Apple platforms. FluidAudio may be a path there.
+
+---
+
+## Why 30% Faster Requires a Different Algorithm (historical, sequential decoder)
 
 ### The hardware ceiling
 
@@ -210,10 +287,13 @@ hardware. Python's `@mx.compile` on the full decode step provides no measurable 
 
 4. **distil-whisper** or quantized smaller model: 3-5x faster with some quality trade-off.
 
-## Remaining Gap and Why
+## Remaining Gap and Why (sequential decoder, superseded by Session 3)
 
-Swift is at parity with Python (~0% difference). The target of 30% faster Python remains unmet.
-The most significant remaining opportunity:
+Swift sequential is at parity with Python (~0% difference). With batching (Session 3),
+Swift is 10% faster including word timestamps. The notes below were written before batching
+was implemented; they are kept for historical context.
+
+The most significant remaining opportunity for the sequential path was:
 
 ### Python `@mx.compile` on the full decode step
 
@@ -249,11 +329,17 @@ under ideal conditions.
 
 - **Swift CLI**: `benchmarks/cli/WhisperBenchmarkCLI.swift` — built with `xcodebuild` (required
   for Metal library linking; `swift run` does not work)
-- **Python script**: `benchmarks/benchmark.py` — requires meeting-transcriber venv
-  (`/Users/francesco.mosca/Work/meeting-transcriber/.venv/bin/python3`)
-- **Fixtures**: `benchmarks/fixtures/ami_ES2002a_{full,5min}.wav`, `ami_ES2002a_baseline.txt`
-- **Quick run** (5 min): `WhisperBenchmark quick` (~2 minutes)
-- **Full run** (21 min): `WhisperBenchmark full` (~6 minutes, 3 iterations)
+- **Python baseline**: `benchmarks/scripts/word_baseline.py` — generates word-level JSON for
+  `word-compare` mode (`condition_on_previous_text=False`)
+- **Fixtures**: `benchmarks/fixtures/ami_ES2002a_{full,5min}.wav`,
+  `ami_ES2002a_5min_word_baseline.json`
+
+**CLI modes:**
+- `quick` / `full` — sequential, 5-min / 21-min
+- `batch-quick` / `batch-full` — batched B=4, no word timestamps
+- `compare` / `compare-full` — sequential vs batched side-by-side
+- `word-compare` — batched with word timestamps vs Python baseline
+- `vad-scan [dir] [maxFiles]` — VAD parameter validation on real recordings
 
 ### Build command
 
