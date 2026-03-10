@@ -29,6 +29,8 @@ let package = Package(
     .package(url: "https://github.com/DePasqualeOrg/swift-tiktoken", branch: "main"),
     // Silero VAD (CoreML, ANE-accelerated) for batched transcription segmentation
     .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.3"),
+    // Qwen3-ForcedAligner for word-level timestamp alignment (alternative to DTW)
+    .package(url: "https://github.com/soniqo/speech-swift.git", branch: "main"),
     // espeak-ng is GPLv3 licensed - only linked when using Kokoro
     // TODO: Switch back to upstream after https://github.com/espeak-ng/espeak-ng/pull/2327 is merged
     .package(url: "https://github.com/DePasqualeOrg/espeak-ng-spm.git", branch: "fix-path-espeak-data-macro"),
@@ -66,7 +68,10 @@ let package = Package(
     ),
     .executableTarget(
       name: "WhisperBenchmark",
-      dependencies: ["MLXAudio"],
+      dependencies: [
+        "MLXAudio",
+        .product(name: "Qwen3ASR", package: "speech-swift"),
+      ],
       path: "benchmarks/cli",
     ),
   ],

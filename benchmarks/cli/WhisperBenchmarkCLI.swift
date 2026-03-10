@@ -2,6 +2,7 @@ import AVFoundation
 import FluidAudio
 import Foundation
 import MLXAudio
+import Qwen3ASR
 
 @main
 struct WhisperBenchmarkCLI {
@@ -49,6 +50,14 @@ struct WhisperBenchmarkCLI {
         let audioFile = args.count > 2 ? args[2] : "ami_ES2002a_full.wav"
         let baselineFile = args.count > 3 ? args[3] : nil
         try await runWordCompare(audioFile: audioFile, baselineFile: baselineFile)
+      case "parakeet-compare":
+        let audioFile = args.count > 2 ? args[2] : "amicorpus-ES2002a.mp3"
+        let baselineFile = args.count > 3 ? args[3] : nil
+        try await runParakeetCompare(audioFile: audioFile, baselineFile: baselineFile)
+      case "qwen3-align":
+        let audioFile = args.count > 2 ? args[2] : "ami_ES2002a_5min.wav"
+        let baselineFile = args.count > 3 ? args[3] : nil
+        try await runQwen3AlignCompare(audioFile: audioFile, baselineFile: baselineFile)
       default:
         printUsage()
       }
@@ -82,6 +91,15 @@ struct WhisperBenchmarkCLI {
                       python benchmarks/scripts/word_baseline.py benchmarks/fixtures/<audio>
       word-compare-full [audio] [baseline_json]
                     Same as word-compare using the full 21-min fixture.
+      parakeet-compare [audio] [baseline_json]
+                    Compare FluidAudio Parakeet-TDT (native timestamps) against
+                    Python Whisper baseline. Tests whether Parakeet can replace
+                    Whisper's cross-attention DTW for word alignment.
+      qwen3-align [audio] [baseline_json]
+                    Compare Qwen3-ForcedAligner (dedicated alignment model) against
+                    Python Whisper baseline. Uses Whisper for transcription, then
+                    Qwen3 for alignment. Expected to be faster and more accurate
+                    than DTW-based approaches.
     """)
   }
 
@@ -395,6 +413,298 @@ struct WhisperBenchmarkCLI {
       print(String(format: "    %-20@  py [%.2f–%.2f]  sw [%.2f–%.2f]  Δ%+.3fs",
                    pw.word as NSString, pw.start, pw.end, swStart, swEnd,
                    swStart - pw.start))
+    }
+  }
+
+  // MARK: - Parakeet comparison
+
+  /// Compare FluidAudio Parakeet-TDT (native timestamps) against Python Whisper baseline.
+  /// Tests whether Parakeet's TDT-based timestamps are better than Whisper's DTW.
+  static func runParakeetCompare(audioFile: String, baselineFile: String?) async throws {
+    let audioURL = URL(fileURLWithPath: fixturesPath).appendingPathComponent(audioFile)
+    guard FileManager.default.fileExists(atPath: audioURL.path) else {
+      throw BenchmarkError.fixtureNotFound(audioURL.path)
+    }
+
+    let audioDuration = try getAudioDuration(audioURL)
+    print("\nAudio: \(audioFile)  [\(fmt1(audioDuration))s / \(String(format: "%.1f", audioDuration / 60)) min]")
+
+    // Locate baseline JSON
+    let stem = audioURL.deletingPathExtension().lastPathComponent
+    let baselineURL: URL
+    if let bf = baselineFile {
+      baselineURL = URL(fileURLWithPath: bf)
+    } else {
+      baselineURL = URL(fileURLWithPath: fixturesPath).appendingPathComponent("\(stem)_word_baseline.json")
+    }
+    guard FileManager.default.fileExists(atPath: baselineURL.path) else {
+      print("""
+        Baseline not found: \(baselineURL.path)
+
+        Generate it first:
+          python benchmarks/scripts/word_baseline.py \(audioURL.path)
+        """)
+      throw BenchmarkError.fixtureNotFound(baselineURL.path)
+    }
+
+    let pythonWords = try JSONDecoder().decode([PythonWord].self, from: Data(contentsOf: baselineURL))
+    print("Python baseline: \(pythonWords.count) words loaded from \(baselineURL.lastPathComponent)")
+
+    // Load audio as 16kHz mono Float32
+    print("\nLoading audio for Parakeet...")
+    let samples = try load16kMono(url: audioURL, maxSeconds: nil)
+    print("Loaded \(samples.count) samples (\(fmt1(Double(samples.count) / 16000))s)")
+
+    // Initialize Parakeet
+    print("\nInitializing Parakeet-TDT (CoreML)...")
+    let asrModels = try await AsrModels.loadFromCache()
+    let asrManager = AsrManager()
+    try await asrManager.initialize(models: asrModels)
+    print("Parakeet ready.")
+
+    // Transcribe
+    print("\nTranscribing with Parakeet-TDT...")
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let result = try await asrManager.transcribe(samples, source: .system)
+    let elapsed = CFAbsoluteTimeGetCurrent() - t0
+    let rtf = elapsed / audioDuration
+
+    // Extract word timings from token timings
+    let tokenTimings = result.tokenTimings ?? []
+    let parakeetWords: [(word: String, start: Double, end: Double)] = tokenTimings.map {
+      ($0.token.trimmingCharacters(in: .whitespaces), $0.startTime, $0.endTime)
+    }.filter { !$0.word.isEmpty }
+
+    print("Parakeet output: \(parakeetWords.count) tokens  RTF=\(fmt4(rtf))")
+    print("Text preview: \(result.text.prefix(200))...")
+
+    // ── Text quality: word Jaccard ──────────────────────────────────────────
+    let pySet = Set(pythonWords.map { $0.word.lowercased() })
+    let pkSet = Set(parakeetWords.map { $0.word.lowercased() })
+    let intersection = pySet.intersection(pkSet).count
+    let union = pySet.union(pkSet).count
+    let jaccard = union > 0 ? Double(intersection) / Double(union) : 0.0
+
+    // ── Timing accuracy: one-to-one greedy matching ──
+    struct ParakeetEntry { var start, end: Double; var used: Bool }
+    var parakeetIndex: [String: [ParakeetEntry]] = [:]
+    for w in parakeetWords {
+      let key = w.word.lowercased()
+      parakeetIndex[key, default: []].append(ParakeetEntry(start: w.start, end: w.end, used: false))
+    }
+
+    var signedStartErrors: [Double] = []
+    var absEndErrors: [Double] = []
+
+    for pw in pythonWords {
+      let key = pw.word.lowercased()
+      guard var candidates = parakeetIndex[key] else { continue }
+      var bestIdx: Int? = nil
+      var bestDist = 1.5
+      for (i, c) in candidates.enumerated() where !c.used {
+        let d = abs(c.start - pw.start)
+        if d < bestDist { bestDist = d; bestIdx = i }
+      }
+      guard let idx = bestIdx else { continue }
+      candidates[idx].used = true
+      parakeetIndex[key] = candidates
+      signedStartErrors.append(candidates[idx].start - pw.start)
+      absEndErrors.append(abs(candidates[idx].end - pw.end))
+    }
+
+    let matchRate = pythonWords.isEmpty ? 0.0 : Double(signedStartErrors.count) / Double(pythonWords.count)
+    let startMAE = signedStartErrors.isEmpty ? 0.0 : signedStartErrors.map(abs).reduce(0, +) / Double(signedStartErrors.count)
+    let endMAE = absEndErrors.isEmpty ? 0.0 : absEndErrors.reduce(0, +) / Double(absEndErrors.count)
+    let startBias = signedStartErrors.isEmpty ? 0.0 : signedStartErrors.reduce(0, +) / Double(signedStartErrors.count)
+    let sortedAbsStart = signedStartErrors.map(abs).sorted()
+    let startP90 = sortedAbsStart.isEmpty ? 0.0 : sortedAbsStart[Int(Double(sortedAbsStart.count) * 0.9)]
+
+    // ── Report ──────────────────────────────────────────────────────────────
+    let sep = String(repeating: "=", count: 70)
+    print("\n\(sep)")
+    print("PARAKEET-TDT vs PYTHON WHISPER  [\(audioFile)]")
+    print(sep)
+    print("  RTF (Parakeet-TDT): \(fmt4(rtf))")
+    print("")
+    print("  Text quality")
+    print(String(format: "    Python words:     %ld", pythonWords.count))
+    print(String(format: "    Parakeet tokens:  %ld", parakeetWords.count))
+    print(String(format: "    Word Jaccard:     %.3f  (1.0 = identical vocabulary)", jaccard))
+    print("")
+    print("  Timing accuracy  (\(signedStartErrors.count) matched pairs, ±1.5 s window)")
+    print(String(format: "    Match rate:       %.1f%%", matchRate * 100))
+    print(String(format: "    Start MAE:        %.3f s", startMAE))
+    print(String(format: "    End MAE:          %.3f s", endMAE))
+    print(String(format: "    Start p90 err:    %.3f s", startP90))
+    print(String(format: "    Start bias:       %+.3f s", startBias))
+
+    let timingGrade: String
+    if startMAE < 0.05 { timingGrade = "excellent (< 50 ms)" }
+    else if startMAE < 0.10 { timingGrade = "good (< 100 ms)" }
+    else if startMAE < 0.20 { timingGrade = "acceptable (< 200 ms)" }
+    else { timingGrade = "poor (> 200 ms)" }
+    print("    Assessment:       \(timingGrade)")
+
+    print("\n  Parakeet text (first 500 chars):")
+    print("    \(result.text.prefix(500))")
+  }
+
+  // MARK: - Qwen3 ForcedAligner comparison
+
+  /// Compare Qwen3-ForcedAligner (dedicated alignment model) against Python Whisper baseline.
+  /// Uses Whisper for transcription, then Qwen3 for word-level alignment.
+  static func runQwen3AlignCompare(audioFile: String, baselineFile: String?) async throws {
+    let audioURL = URL(fileURLWithPath: fixturesPath).appendingPathComponent(audioFile)
+    guard FileManager.default.fileExists(atPath: audioURL.path) else {
+      throw BenchmarkError.fixtureNotFound(audioURL.path)
+    }
+
+    let audioDuration = try getAudioDuration(audioURL)
+    print("\nAudio: \(audioFile)  [\(fmt1(audioDuration))s / \(String(format: "%.1f", audioDuration / 60)) min]")
+
+    // Locate baseline JSON
+    let stem = audioURL.deletingPathExtension().lastPathComponent
+    let baselineURL: URL
+    if let bf = baselineFile {
+      baselineURL = URL(fileURLWithPath: bf)
+    } else {
+      baselineURL = URL(fileURLWithPath: fixturesPath).appendingPathComponent("\(stem)_word_baseline.json")
+    }
+    guard FileManager.default.fileExists(atPath: baselineURL.path) else {
+      print("""
+        Baseline not found: \(baselineURL.path)
+
+        Generate it first:
+          python benchmarks/scripts/word_baseline.py \(audioURL.path)
+        """)
+      throw BenchmarkError.fixtureNotFound(baselineURL.path)
+    }
+
+    let pythonWords = try JSONDecoder().decode([PythonWord].self, from: Data(contentsOf: baselineURL))
+    print("Python baseline: \(pythonWords.count) words loaded from \(baselineURL.lastPathComponent)")
+
+    // Step 1: Transcribe with Whisper (batched, no word timestamps)
+    print("\n[Step 1] Transcribing with Whisper (batched)...")
+    let (whisperEngine, _, _) = try await loadEngine(audioFile: audioFile)
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let transcription = try await whisperEngine.transcribeBatched(
+      audioURL,
+      timestamps: .none,
+      batchSize: 4
+    )
+    let whisperTime = CFAbsoluteTimeGetCurrent() - t0
+    let whisperRTF = whisperTime / audioDuration
+    print("Whisper transcription: \(fmt1(whisperTime))s  RTF=\(fmt4(whisperRTF))")
+
+    // Extract text from segments
+    let whisperText = transcription.segments.map { $0.text.trimmingCharacters(in: CharacterSet.whitespaces) }.joined(separator: " ")
+    print("Whisper text (\(whisperText.count) chars): \(whisperText.prefix(200))...")
+
+    // Load audio for Qwen3 (16kHz mono)
+    print("\nLoading audio for alignment...")
+    let samples16k = try load16kMono(url: audioURL, maxSeconds: nil)
+    print("Loaded \(samples16k.count) samples (\(fmt1(Double(samples16k.count) / 16000))s @ 16kHz)")
+
+    // Step 2: Align with Qwen3-ForcedAligner
+    print("\n[Step 2] Aligning with Qwen3-ForcedAligner...")
+    let aligner = try await Qwen3ForcedAligner.fromPretrained(
+      modelId: "aufklarer/Qwen3-ForcedAligner-0.6B-4bit"
+    ) { progress, status in
+      if progress < 1.0 { print("  [\(Int(progress * 100))%] \(status)") }
+    }
+
+    let t1 = CFAbsoluteTimeGetCurrent()
+    let alignedWords = aligner.align(
+      audio: samples16k,
+      text: whisperText,
+      sampleRate: 16000,
+      language: "English"
+    )
+    let alignTime = CFAbsoluteTimeGetCurrent() - t1
+    let alignRTF = alignTime / audioDuration
+    print("Qwen3 alignment: \(fmt1(alignTime))s  RTF=\(fmt4(alignRTF))")
+    print("Aligned \(alignedWords.count) words")
+
+    // Total time (Whisper + Qwen3)
+    let totalTime = whisperTime + alignTime
+    let totalRTF = totalTime / audioDuration
+
+    // ── Timing accuracy: one-to-one greedy matching ──
+    struct QwenEntry { var start, end: Double; var used: Bool }
+    var qwenIndex: [String: [QwenEntry]] = [:]
+    for w in alignedWords {
+      let key = w.text.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters)
+      qwenIndex[key, default: []].append(QwenEntry(start: Double(w.startTime), end: Double(w.endTime), used: false))
+    }
+
+    var signedStartErrors: [Double] = []
+    var absEndErrors: [Double] = []
+
+    for pw in pythonWords {
+      let key = pw.word.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters)
+      guard var candidates = qwenIndex[key] else { continue }
+      var bestIdx: Int? = nil
+      var bestDist = 1.5
+      for (i, c) in candidates.enumerated() where !c.used {
+        let d = abs(c.start - pw.start)
+        if d < bestDist { bestDist = d; bestIdx = i }
+      }
+      guard let idx = bestIdx else { continue }
+      candidates[idx].used = true
+      qwenIndex[key] = candidates
+      signedStartErrors.append(candidates[idx].start - pw.start)
+      absEndErrors.append(abs(candidates[idx].end - pw.end))
+    }
+
+    let matchRate = pythonWords.isEmpty ? 0.0 : Double(signedStartErrors.count) / Double(pythonWords.count)
+    let startMAE = signedStartErrors.isEmpty ? 0.0 : signedStartErrors.map(abs).reduce(0, +) / Double(signedStartErrors.count)
+    let endMAE = absEndErrors.isEmpty ? 0.0 : absEndErrors.reduce(0, +) / Double(absEndErrors.count)
+    let startBias = signedStartErrors.isEmpty ? 0.0 : signedStartErrors.reduce(0, +) / Double(signedStartErrors.count)
+    let sortedAbsStart = signedStartErrors.map(abs).sorted()
+    let startP90 = sortedAbsStart.isEmpty ? 0.0 : sortedAbsStart[Int(Double(sortedAbsStart.count) * 0.9)]
+
+    // ── Report ──────────────────────────────────────────────────────────────
+    let sep = String(repeating: "=", count: 70)
+    print("\n\(sep)")
+    print("QWEN3-FORCEDALIGNER vs PYTHON WHISPER  [\(audioFile)]")
+    print(sep)
+    print("  Timing breakdown")
+    print(String(format: "    Whisper ASR:      %.1fs  RTF=%.4f", whisperTime, whisperRTF))
+    print(String(format: "    Qwen3 align:      %.1fs  RTF=%.4f", alignTime, alignRTF))
+    print(String(format: "    TOTAL:            %.1fs  RTF=%.4f", totalTime, totalRTF))
+    print("")
+    print("  Word counts")
+    print(String(format: "    Python baseline:  %ld", pythonWords.count))
+    print(String(format: "    Qwen3 aligned:    %ld", alignedWords.count))
+    print("")
+    print("  Timing accuracy  (\(signedStartErrors.count) matched pairs, ±1.5 s window)")
+    print(String(format: "    Match rate:       %.1f%%", matchRate * 100))
+    print(String(format: "    Start MAE:        %.3f s  (%.0f ms)", startMAE, startMAE * 1000))
+    print(String(format: "    End MAE:          %.3f s  (%.0f ms)", endMAE, endMAE * 1000))
+    print(String(format: "    Start p90 err:    %.3f s", startP90))
+    print(String(format: "    Start bias:       %+.3f s", startBias))
+
+    let timingGrade: String
+    if startMAE < 0.05 { timingGrade = "excellent (< 50 ms)" }
+    else if startMAE < 0.10 { timingGrade = "good (< 100 ms)" }
+    else if startMAE < 0.20 { timingGrade = "acceptable (< 200 ms)" }
+    else { timingGrade = "poor (> 200 ms)" }
+    print("    Assessment:       \(timingGrade)")
+
+    // Compare with DTW baseline (our current implementation)
+    print("\n  Comparison with DTW-based approach")
+    print("    DTW Start MAE:    ~91 ms (from word-compare-full)")
+    print(String(format: "    Qwen3 Start MAE:  %.0f ms", startMAE * 1000))
+    if startMAE < 0.091 {
+      print("    → Qwen3 is MORE accurate than DTW")
+    } else {
+      print("    → Qwen3 is LESS accurate than DTW")
+    }
+
+    // Sample output
+    print("\n  First 10 aligned words:")
+    for word in alignedWords.prefix(10) {
+      print(String(format: "    [%.2f–%.2f] %@", word.startTime, word.endTime, word.text as NSString))
     }
   }
 
