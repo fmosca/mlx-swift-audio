@@ -589,7 +589,7 @@ actor WhisperSTT {
               }
               // Python: window_end_time - segment["end"] < 2.0
               let silenceAfter = (halNextStart - segmentEnd > threshold) ||
-                isSegmentAnomaly(nextWordTimings) ||
+                isSegmentAnomaly(nextWordTimings ?? []) ||
                 (windowEndTime - segmentEnd < 2.0)
 
               if silenceBefore, silenceAfter {
@@ -880,13 +880,19 @@ actor WhisperSTT {
         batchPrompt = lastResult.tokens.filter { $0 != tokenizer.eot }
       }
 
+      // 1. Filter and prepare data for this batch
+      var acceptedSegments: [TranscriptionSegment] = []
+      var acceptedIndices: [Int] = []
+      var acceptedTimeOffsets: [Float] = []
+      var acceptedFrameCounts: [Int] = []
+
       for (batchIdx, (seg, result)) in zip(batch, results).enumerated() {
         guard shouldAccept(result) else { continue }
         let textTokens = result.tokens.filter { $0 < tokenizer.eot }
         let text = tokenizer.decode(textTokens).trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { continue }
 
-        var segment = TranscriptionSegment(
+        let segment = TranscriptionSegment(
           text: text,
           start: seg.startTime,
           end: seg.endTime,
@@ -895,40 +901,52 @@ actor WhisperSTT {
           noSpeechProb: result.noSpeechProb,
           words: nil
         )
+        
+        acceptedSegments.append(segment)
+        acceptedIndices.append(batchIdx)
+        acceptedTimeOffsets.append(Float(seg.startTime))
+        acceptedFrameCounts.append(validFrameCounts[batchIdx])
+      }
 
-        if timestamps == .word {
-          // Decoder-only alignment pass: reuse audioFeaturesStack[batchIdx]
-          // from the encode step above, skipping the encoder re-run entirely.
-          var segs = [segment]
-          _ = addWordTimestamps(
-            segments: &segs,
-            model: model,
-            tokenizer: tokenizer,
-            mel: melSlices[batchIdx],
-            audioFeatures: audioFeaturesStack[batchIdx],
-            numFrames: validFrameCounts[batchIdx],
-            language: languageToUse,
-            task: task,
-            timeOffset: Float(seg.startTime),
-            lastSpeechTimestamp: Float(seg.startTime)
-          )
-          segment = segs[0]
-
-          // Hallucination silence gate: if any inter-word gap exceeds the threshold
-          // the DTW aligner found a long silence inside what VAD marked as speech —
-          // almost certainly a hallucination.  Mirrors faster-whisper's
-          // hallucination_silence_threshold logic.
-          if let words = segment.words, words.count > 1 {
-            let maxGap = zip(words, words.dropFirst())
-              .map { Double($1.start) - Double($0.end) }
-              .max() ?? 0
-            if maxGap > hallucinationSilenceThreshold {
-              continue
-            }
+      if !acceptedSegments.isEmpty {
+          if timestamps == .word {
+              // Gather audio features and mel for accepted segments
+              // This is a GPU-side slice (take) to avoid transferring full batch if filtering occurred
+              let indicesArray = MLXArray(acceptedIndices.map { Int32($0) })
+              let batchAudioFeatures = audioFeaturesStack.take(indicesArray, axis: 0)
+              let batchMel = melStack.take(indicesArray, axis: 0)
+              
+              // Run batched alignment (single GPU-accelerated pass for all segments)
+              _ = addWordTimestamps(
+                  segments: &acceptedSegments,
+                  model: model,
+                  tokenizer: tokenizer,
+                  mel: batchMel,
+                  audioFeatures: batchAudioFeatures,
+                  numFrames: acceptedFrameCounts,
+                  language: languageToUse,
+                  task: task,
+                  timeOffset: 0, // Unused when timeOffsets provided
+                  timeOffsets: acceptedTimeOffsets,
+                  lastSpeechTimestamp: 0 // Not relevant for independent segments
+              )
           }
-        }
-
-        collected.append((globalStart: seg.startTime, segment: segment))
+          
+          // Post-processing and collection
+          for segment in acceptedSegments {
+             // Hallucination silence gate: if any inter-word gap exceeds the threshold
+             // the DTW aligner found a long silence inside what VAD marked as speech —
+             // almost certainly a hallucination. Mirrors faster-whisper's logic.
+             if timestamps == .word, let words = segment.words, words.count > 1 {
+                 let maxGap = zip(words, words.dropFirst())
+                   .map { Double($1.start) - Double($0.end) }
+                   .max() ?? 0
+                 if maxGap > hallucinationSilenceThreshold {
+                   continue
+                 }
+             }
+             collected.append((globalStart: segment.start, segment: segment))
+          }
       }
 
       idx = end
@@ -1119,5 +1137,27 @@ actor WhisperSTT {
     }
 
     return segments
+  }
+
+  // MARK: - Helper Functions
+
+  private func getLastWordEnd(_ segments: [TranscriptionSegment]) -> Float? {
+    for segment in segments.reversed() {
+      if let words = segment.words, let last = words.last {
+        return Float(last.end)
+      }
+    }
+    return nil
+  }
+
+  private func isSegmentAnomaly(_ words: [WordTiming]) -> Bool {
+    guard !words.isEmpty else { return false }
+    // Check for very short words or very low probability
+    let duration = words.last!.end - words.first!.start
+    if duration < 0.1 { return true }
+    // Check for low probability
+    let avgProb = words.reduce(0) { $0 + $1.probability } / Float(words.count)
+    if avgProb < 0.3 { return true }
+    return false
   }
 }

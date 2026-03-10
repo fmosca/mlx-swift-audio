@@ -129,185 +129,6 @@ func backtrace(_ trace: [Int8], rows: Int, cols: Int) -> (textIndices: [Int], ti
   return (result.map { $0.0 }, result.map { $0.1 })
 }
 
-// MARK: - Median Filter
-
-/// Fast median of 7 elements using optimal comparison network
-///
-/// Uses 10 comparisons to find the median (vs 16 for full sort).
-/// Based on the optimal comparison network for median selection.
-@inline(__always)
-@usableFromInline
-func median7(_ a: Float, _ b: Float, _ c: Float, _ d: Float, _ e: Float, _ f: Float, _ g: Float) -> Float {
-  // Sorting network approach - swap pairs to bubble median to center
-  var v0 = a, v1 = b, v2 = c, v3 = d, v4 = e, v5 = f, v6 = g
-
-  // Comparison network optimized for finding median of 7
-  @inline(__always)
-  func sortPair(_ x: inout Float, _ y: inout Float) {
-    if x > y { swap(&x, &y) }
-  }
-
-  // Stage 1: Sort pairs
-  sortPair(&v0, &v1)
-  sortPair(&v2, &v3)
-  sortPair(&v4, &v5)
-
-  // Stage 2: Find smaller of the larger elements
-  sortPair(&v1, &v3)
-  sortPair(&v3, &v5)
-  sortPair(&v1, &v3)
-
-  // Stage 3: Ensure v6 is in right position
-  sortPair(&v3, &v6)
-
-  // Stage 4: Sort remaining to find median
-  sortPair(&v0, &v2)
-  sortPair(&v2, &v4)
-  sortPair(&v0, &v2)
-
-  // Stage 5: Final comparisons to isolate median
-  sortPair(&v2, &v3)
-  sortPair(&v3, &v4)
-  sortPair(&v3, &v2)
-
-  // v3 is now the median
-  return max(v2, min(v3, v4))
-}
-
-/// Median filter for attention weight smoothing
-///
-/// Applies a 1D median filter along the frames dimension for each head and token.
-/// Uses reflect padding to handle boundaries, matching scipy.signal.medfilt behavior.
-/// Optimized with parallel processing and fast median-of-7.
-///
-/// - Parameters:
-///   - weights: Flat attention weights array of shape (heads, tokens, frames)
-///   - heads: Number of attention heads
-///   - tokens: Number of tokens
-///   - frames: Number of frames
-///   - filterWidth: Filter width (must be odd, default 7)
-/// - Returns: Filtered weights with same shape
-@inlinable
-func medianFilterAttention(
-  _ weights: [Float],
-  heads: Int,
-  tokens: Int,
-  frames: Int,
-  filterWidth: Int = 7
-) -> [Float] {
-  precondition(filterWidth == 7, "Only filterWidth=7 is optimized")
-
-  let totalRows = heads * tokens
-  var result = [Float](repeating: 0, count: weights.count)
-
-  // Process rows in parallel (each row is independent)
-  weights.withUnsafeBufferPointer { weightsPtr in
-    result.withUnsafeMutableBufferPointer { resultPtr in
-      // Using nonisolated(unsafe) is appropriate here because:
-      // 1. Performance-critical: tight loop processing audio data benefits from pointer arithmetic
-      // 2. Provably safe: each iteration accesses non-overlapping memory (different rows)
-      // 3. Synchronous: pointers don't escape; operation completes before buffer scope ends
-      // 4. DispatchQueue.concurrentPerform is more efficient than withTaskGroup for CPU-bound work
-      nonisolated(unsafe) let weightsBase = weightsPtr.baseAddress!
-      nonisolated(unsafe) let resultBase = resultPtr.baseAddress!
-      DispatchQueue.concurrentPerform(iterations: totalRows) { rowIdx in
-        let rowStart = rowIdx * frames
-        let rowPtr = weightsBase + rowStart
-        let outPtr = resultBase + rowStart
-
-        // Helper to get value with reflect padding
-        @inline(__always)
-        func getValue(_ idx: Int) -> Float {
-          var i = idx
-          if i < 0 { i = -i }
-          if i >= frames { i = 2 * frames - i - 2 }
-          i = max(0, min(frames - 1, i))
-          return rowPtr[i]
-        }
-
-        // Apply median filter using optimized median7
-        for f in 0 ..< frames {
-          outPtr[f] = median7(
-            getValue(f - 3),
-            getValue(f - 2),
-            getValue(f - 1),
-            getValue(f),
-            getValue(f + 1),
-            getValue(f + 2),
-            getValue(f + 3)
-          )
-        }
-      }
-    }
-  }
-
-  return result
-}
-
-// MARK: - Softmax Utilities
-
-/// Apply softmax to a row of values in-place
-///
-/// - Parameters:
-///   - values: Array to apply softmax to
-///   - scale: Optional scaling factor (for QK scaling)
-@inline(__always)
-func softmaxInPlace(_ values: inout [Float], scale: Float = 1.0) {
-  // Apply scaling
-  if scale != 1.0 {
-    for i in 0 ..< values.count {
-      values[i] *= scale
-    }
-  }
-
-  // Find max for numerical stability
-  var maxVal: Float = -.infinity
-  vDSP_maxv(values, 1, &maxVal, vDSP_Length(values.count))
-
-  // Subtract max and exponentiate
-  var negMax = -maxVal
-  vDSP_vsadd(values, 1, &negMax, &values, 1, vDSP_Length(values.count))
-
-  // Exponentiate
-  var count = Int32(values.count)
-  vvexpf(&values, values, &count)
-
-  // Normalize
-  var sum: Float = 0
-  vDSP_sve(values, 1, &sum, vDSP_Length(values.count))
-  if sum > 0 {
-    var invSum = 1.0 / sum
-    vDSP_vsmul(values, 1, &invSum, &values, 1, vDSP_Length(values.count))
-  }
-}
-
-/// Standardize values: (x - mean) / std
-///
-/// - Parameters:
-///   - values: Array to standardize in-place
-///   - eps: Small value to prevent division by zero
-@inline(__always)
-func standardizeInPlace(_ values: inout [Float], eps: Float = 1e-8) {
-  let count = vDSP_Length(values.count)
-
-  // Calculate mean
-  var mean: Float = 0
-  vDSP_meanv(values, 1, &mean, count)
-
-  // Subtract mean
-  var negMean = -mean
-  vDSP_vsadd(values, 1, &negMean, &values, 1, count)
-
-  // Calculate std (sqrt of mean of squares after mean subtraction)
-  var sumSq: Float = 0
-  vDSP_svesq(values, 1, &sumSq, count)
-  let std = sqrt(sumSq / Float(values.count)) + eps
-
-  // Divide by std
-  var invStd = 1.0 / std
-  vDSP_vsmul(values, 1, &invStd, &values, 1, count)
-}
-
 // MARK: - Punctuation Merging
 
 /// Default punctuation characters to prepend to following word
@@ -534,6 +355,58 @@ func adjustSegmentBoundaries(
   return (adjustedStart, adjustedEnd, adjustedEnd)
 }
 
+// MARK: - GPU Median Filter
+
+/// GPU-accelerated median filter (width=7)
+///
+/// Optimized implementation using MLX primitives to avoid CPU transfer.
+/// Uses a "shift-stack-sort" approach:
+/// 1. Pad input with reflection (matching scipy.signal.medfilt)
+/// 2. Create 7 shifted views of the data
+/// 3. Stack them on a new axis
+/// 4. Sort along that axis and take the middle element
+///
+/// - Parameters:
+///   - weights: Input tensor of shape (..., frames)
+/// - Returns: Filtered tensor of same shape
+func medianFilterAttentionGPU(_ weights: MLXArray) -> MLXArray {
+  let shape = weights.shape
+  let F = shape.last! // Frames is the last dimension
+  let W = 7
+  let P = W / 2 // 3
+
+  // Reflect padding:
+  // Left: weights[..., 3, 2, 1] (indices 1, 2, 3 reversed)
+  // Right: weights[..., F-2, F-3, F-4] (indices F-4, F-3, F-2 reversed)
+
+  // Simplest approach: concatenate on axis -1.
+  
+  // Left pad: weights[..., 3:0:-1]
+  let leftPad = weights[.ellipsis, stride(from: P, to: 0, by: -1)]
+  
+  // Right pad: weights[..., -2:-5:-1]
+  let rightPad = weights[.ellipsis, stride(from: F - 2, to: F - 2 - P, by: -1)]
+  
+  let padded = MLX.concatenated([leftPad, weights, rightPad], axis: -1)
+  
+  // Create shifted views
+  var stacked: [MLXArray] = []
+  for i in 0 ..< W {
+    // Slice frames: padded[..., i ..< i + F]
+    let slice = padded[.ellipsis, i ..< (i + F)]
+    stacked.append(slice)
+  }
+  
+  // Stack -> (..., F, W)
+  let stackedTensor = MLX.stacked(stacked, axis: -1)
+  
+  // Sort along last axis
+  let sorted = MLX.sorted(stackedTensor, axis: -1)
+  
+  // Take median (index 3)
+  return sorted[.ellipsis, P]
+}
+
 // MARK: - Find Alignment
 
 /// Find word-level alignment using cross-attention weights and DTW
@@ -547,18 +420,275 @@ func adjustSegmentBoundaries(
 /// - Parameters:
 ///   - model: Whisper model with alignment heads configured
 ///   - tokenizer: Whisper tokenizer
-///   - textTokens: Text tokens to align (without special tokens)
+///   - textTokens: Text tokens to align (without special tokens).
+///                 Can be flat [Int] (single sequence) or [[Int]] (batch).
+///                 If [Int] is passed, it is treated as batch=1.
 ///   - mel: Mel spectrogram (n_frames, n_mels) or (batch, n_frames, n_mels)
-///   - numFrames: Number of audio frames
+///   - numFrames: Number of audio frames (Int for single/constant, or [Int] for batch variable lengths)
 ///   - language: Optional language code for SOT sequence
 ///   - task: Transcription task
 ///   - medfiltWidth: Median filter width (default 7)
 ///   - qkScale: QK scaling factor (default 1.0)
-/// - Returns: Array of word timings
+/// - Returns: Array of word timings (or flattened list for batch=1 to maintain compat)
 func findAlignment(
   model: WhisperModel,
   tokenizer: WhisperTokenizer,
-  textTokens: [Int],
+  textTokens: Any, // [Int] or [[Int]]
+  mel: MLXArray,
+  audioFeatures: MLXArray? = nil,
+  numFrames: Any, // Int or [Int]
+  language: String?,
+  task: TranscriptionTask,
+  medfiltWidth: Int = 7,
+  qkScale: Float = 1.0
+) -> [[WordTiming]] { // Always return batch of results
+  
+  // Normalize input to batch format
+  let batchTokens: [[Int]]
+  if let single = textTokens as? [Int] {
+    batchTokens = [single]
+  } else if let batch = textTokens as? [[Int]] {
+    batchTokens = batch
+  } else {
+    return []
+  }
+  
+  guard !batchTokens.isEmpty, !batchTokens[0].isEmpty else { return [] }
+  let batchSize = batchTokens.count
+  
+  // Normalize numFrames
+  let batchNumFrames: [Int]
+  if let single = numFrames as? Int {
+      batchNumFrames = Array(repeating: single, count: batchSize)
+  } else if let batch = numFrames as? [Int] {
+      batchNumFrames = batch
+  } else {
+      return Array(repeating: [], count: batchSize)
+  }
+
+  // Check if alignment heads are available
+  guard model.alignmentHeads.size > 0 else {
+    Log.model.warning("No alignment heads configured - word timestamps unavailable")
+    return Array(repeating: [], count: batchSize)
+  }
+  
+  // Prepare batch tokens with SOT/EOT
+  var processedBatch: [[Int]] = []
+  var maxLen = 0
+  
+  let sotSeq = tokenizer.sotSequence(language: language, task: task)
+  let noTimestampsIndex = sotSeq.count
+  let textStartIndex = sotSeq.count + 1 // +1 for no_timestamps
+  
+  for tokens in batchTokens {
+    var t = sotSeq
+    t.append(tokenizer.noTimestamps)
+    t.append(contentsOf: tokens)
+    t.append(tokenizer.eot)
+    processedBatch.append(t)
+    maxLen = max(maxLen, t.count)
+  }
+  
+  // Create padded token array [B, MaxLen]
+  var paddedTokens = [Int32]()
+  for t in processedBatch {
+    paddedTokens.append(contentsOf: t.map { Int32($0) })
+    let padCount = maxLen - t.count
+    if padCount > 0 {
+      paddedTokens.append(contentsOf: Array(repeating: Int32(tokenizer.eot), count: padCount))
+    }
+  }
+  
+  let tokenArray = MLXArray(paddedTokens).reshaped([batchSize, maxLen])
+
+  // Forward pass with cross-attention extraction.
+  let (logits, crossQK): (MLXArray, [MLXArray?])
+  if let features = audioFeatures {
+    // features: [B, nFrames, nCh]
+    (logits, crossQK) = model.decodeWithCrossQK(features, tokens: tokenArray)
+  } else {
+    var melBatched = mel
+    if mel.ndim == 2 { melBatched = mel.expandedDimensions(axis: 0) }
+    (logits, crossQK) = model.forwardWithCrossQK(melBatched, tokens: tokenArray)
+  }
+  eval(logits)
+
+  // Get alignment head indices
+  let alignmentHeadsArray = model.alignmentHeads.asArray(Int32.self)
+  let numAlignmentHeads = alignmentHeadsArray.count / 2
+  let maxFrames = batchNumFrames.max() ?? 3000
+  let maxFramesLen = maxFrames / 2
+  
+  // Collect attention weights: [B, Heads, Tokens, Frames]
+  var headWeightsArrays: [MLXArray] = []
+  for h in 0 ..< numAlignmentHeads {
+    let layerIdx = Int(alignmentHeadsArray[h * 2])
+    let headIdx = Int(alignmentHeadsArray[h * 2 + 1])
+    guard layerIdx < crossQK.count, let layerQK = crossQK[layerIdx] else { continue }
+    
+    // layerQK: [B, nHeads, Tokens, Frames]
+    // Extract head: layerQK[0..., headIdx] -> [B, Tokens, Frames]
+    let headWeights = layerQK[0..., headIdx]
+    headWeightsArrays.append(headWeights)
+  }
+  
+  guard !headWeightsArrays.isEmpty else { return Array(repeating: [], count: batchSize) }
+  
+  // Stack heads -> [B, H, T, F]
+  var weights = MLX.stacked(headWeightsArrays, axis: 1)
+  
+  // Slice frames to max length: weights[..., :maxFramesLen]
+  weights = weights[.ellipsis, 0 ..< maxFramesLen]
+  
+  // Normalize (GPU)
+  weights = MLX.softmax(weights * qkScale, axis: -1, precise: true)
+  let mean = MLX.mean(weights, axis: -2, keepDims: true)
+  let variance = MLX.variance(weights, axis: -2, keepDims: true)
+  let std = MLX.sqrt(variance + 1e-8)
+  weights = (weights - mean) / std
+  weights = weights.asType(.float32)
+  
+  // Median Filter (GPU) - [B, H, T, F]
+  let filteredWeights = medianFilterAttentionGPU(weights)
+  
+  // Average across heads (GPU) - [B, T, F]
+  let avgMatrixGPU = MLX.mean(filteredWeights, axis: 1)
+  eval(avgMatrixGPU)
+  
+  // Transfer to CPU for DTW
+  let avgMatrixFlat = avgMatrixGPU.asArray(Float.self)
+  let T = avgMatrixGPU.shape[1] // Max tokens
+  let F = avgMatrixGPU.shape[2] // Frames (maxFramesLen)
+  let stridePerItem = T * F
+  
+  var batchTimings: [[WordTiming]] = []
+  
+  avgMatrixFlat.withUnsafeBufferPointer { avgMatrixPtr in
+    guard let basePtr = avgMatrixPtr.baseAddress else {
+        batchTimings = Array(repeating: [], count: batchSize)
+        return
+    }
+
+    for b in 0..<batchSize {
+      let textTokens = batchTokens[b]
+      let actualTextLen = textTokens.count
+      let itemFramesLen = batchNumFrames[b] / 2
+      
+      // Matrix for this batch item
+      let itemOffset = b * stridePerItem
+      let itemMatrix = basePtr + itemOffset
+      
+      // Extract text portion
+      // Note: column slice is tricky because flattened. We perform row-wise copy.
+      let dtwRows = 1 + actualTextLen // no_timestamps + tokens
+      let dtwCols = itemFramesLen
+      var dtwInput = [Float](repeating: 0, count: dtwRows * dtwCols)
+      
+      for r in 0 ..< dtwRows {
+          // Source row index in itemMatrix (start at no_timestamps = textStartIndex-1)
+          let srcIdx = (textStartIndex - 1 + r) * F
+          
+          // Copy `itemFramesLen` columns
+          // Negate while copying for DTW
+          for c in 0 ..< dtwCols {
+              if c < F { // Safety check, though dtwCols <= F
+                  dtwInput[r * dtwCols + c] = -itemMatrix[srcIdx + c]
+              }
+          }
+      }
+      
+      let (textIndices, timeIndices) = dtwInput.withUnsafeBufferPointer { ptr in
+        dtw(ptr, rows: dtwRows, cols: dtwCols)
+      }
+      
+      if textIndices.isEmpty {
+        batchTimings.append([])
+        continue
+      }
+      
+      let (words, wordTokenGroups) = tokenizer.splitToWordTokens(textTokens + [tokenizer.eot])
+      
+      if wordTokenGroups.count <= 1 {
+         batchTimings.append([])
+         continue
+      }
+      
+      var wordBoundaries = [0]
+      var cumLen = 0
+      for group in wordTokenGroups.dropLast() {
+          cumLen += group.count
+          wordBoundaries.append(cumLen)
+      }
+      
+      var jumpPositions = [0]
+      for i in 1 ..< textIndices.count {
+          if textIndices[i] != textIndices[i - 1] {
+              jumpPositions.append(i)
+          }
+      }
+      
+      let jumpTimes = jumpPositions.map { idx -> Float in
+          guard idx < timeIndices.count else { return 0 }
+          return Float(timeIndices[idx]) / tokensPerSecond
+      }
+      
+      var wordTimings: [WordTiming] = []
+      
+      // Gather token probs from logits (on GPU)
+      let itemLogits = logits[b] // [MaxLen, V]
+      let logitsStart = textStartIndex - 1
+      let itemSampledLogits = itemLogits[logitsStart ..< (logitsStart + actualTextLen), 0 ..< tokenizer.eot]
+      let itemTokenProbs = MLX.softmax(itemSampledLogits, axis: -1, precise: true)
+      
+      // Gather specific token probs
+      let indices = MLXArray(textTokens.map { Int32($0) }).expandedDimensions(axis: 1)
+      let gathered = MLX.takeAlong(itemTokenProbs, indices, axis: 1).squeezed()
+      let tokenProbsArray = gathered.asArray(Float.self)
+      
+      for i in 0 ..< (words.count - 1) {
+          let startBoundary = wordBoundaries[i]
+          let endBoundary = wordBoundaries[i + 1]
+          
+          let startTime: Float
+          let endTime: Float
+          
+          if startBoundary < jumpTimes.count { startTime = jumpTimes[startBoundary] }
+          else if !jumpTimes.isEmpty { startTime = jumpTimes.last! }
+          else { startTime = 0 }
+          
+          if endBoundary < jumpTimes.count { endTime = jumpTimes[endBoundary] }
+          else if !jumpTimes.isEmpty { endTime = jumpTimes.last! }
+          else { endTime = startTime }
+          
+          var avgProb: Float = 0
+          let probStart = wordBoundaries[i]
+          let probEnd = min(wordBoundaries[i + 1], tokenProbsArray.count)
+          if probStart < probEnd {
+              for j in probStart ..< probEnd { avgProb += tokenProbsArray[j] }
+              avgProb /= Float(probEnd - probStart)
+          }
+          
+          wordTimings.append(WordTiming(
+              word: words[i],
+              tokens: wordTokenGroups[i],
+              start: startTime,
+              end: max(endTime, startTime),
+              probability: avgProb
+          ))
+      }
+      
+      batchTimings.append(wordTimings)
+    }
+  }
+  
+  return batchTimings
+}
+
+// Wrapper to maintain backward compatibility for single-sequence calls
+func findAlignment(
+  model: WhisperModel,
+  tokenizer: WhisperTokenizer,
+  textTokens: [Int], // Single sequence
   mel: MLXArray,
   audioFeatures: MLXArray? = nil,
   numFrames: Int,
@@ -567,264 +697,19 @@ func findAlignment(
   medfiltWidth: Int = 7,
   qkScale: Float = 1.0
 ) -> [WordTiming] {
-  guard !textTokens.isEmpty else { return [] }
-
-  // Check if alignment heads are available
-  guard model.alignmentHeads.size > 0 else {
-    Log.model.warning("No alignment heads configured - word timestamps unavailable")
-    return []
-  }
-
-  // Build token sequence: [sot_sequence, no_timestamps, text_tokens, eot]
-  var tokens = tokenizer.sotSequence(language: language, task: task)
-  let noTimestampsIndex = tokens.count // Index of no_timestamps token
-  tokens.append(tokenizer.noTimestamps)
-  let textStartIndex = tokens.count // Where text tokens begin (after no_timestamps)
-  tokens.append(contentsOf: textTokens)
-  tokens.append(tokenizer.eot)
-
-  let tokenArray = MLXArray(tokens.map { Int32($0) }).expandedDimensions(axis: 0)
-
-  // Forward pass with cross-attention extraction.
-  // When pre-computed audio features are provided, skip the encoder entirely.
-  let (logits, crossQK): (MLXArray, [MLXArray?])
-  if let features = audioFeatures {
-    (logits, crossQK) = model.decodeWithCrossQK(features, tokens: tokenArray)
-  } else {
-    var melBatched = mel
-    if mel.ndim == 2 { melBatched = mel.expandedDimensions(axis: 0) }
-    (logits, crossQK) = model.forwardWithCrossQK(melBatched, tokens: tokenArray)
-  }
-  eval(logits) // Ensure computation is complete
-
-  // Get text token probabilities for confidence scores
-  // logits[i] predicts tokens[i+1], so to predict text_tokens we need logits starting
-  // at position (textStartIndex - 1), which is the no_timestamps token position
-  let logitsStartIndex = textStartIndex - 1
-  let sampledLogits = logits[0, logitsStartIndex ..< (tokens.count - 2), 0 ..< tokenizer.eot]
-  let tokenProbs = MLX.softmax(sampledLogits, axis: -1, precise: true)
-  eval(tokenProbs)
-
-  // Extract probabilities for actual text tokens
-  var textTokenProbs = [Float](repeating: 0, count: textTokens.count)
-  for (i, token) in textTokens.enumerated() {
-    textTokenProbs[i] = tokenProbs[i, token].item(Float.self)
-  }
-
-  // Get alignment head indices
-  let alignmentHeadsArray = model.alignmentHeads.asArray(Int32.self)
-  let numAlignmentHeads = alignmentHeadsArray.count / 2
-
-  guard numAlignmentHeads > 0 else {
-    Log.model.warning("Alignment heads array is empty")
-    return []
-  }
-
-  // Determine frame count (Whisper uses stride-2 convolution)
-  let framesLen = numFrames / 2
-
-  // Collect attention weights from alignment heads using MLX (GPU)
-  // Python: weights = mx.stack([cross_qk[_l][0, _h] for _l, _h in model.alignment_heads.tolist()])
-  var headWeightsArrays: [MLXArray] = []
-
-  for h in 0 ..< numAlignmentHeads {
-    let layerIdx = Int(alignmentHeadsArray[h * 2])
-    let headIdx = Int(alignmentHeadsArray[h * 2 + 1])
-
-    guard layerIdx < crossQK.count, let layerQK = crossQK[layerIdx] else {
-      continue
-    }
-
-    // Extract weights for this head: shape (batch, heads, tokens, frames)
-    let headWeights = layerQK[0, headIdx]
-    headWeightsArrays.append(headWeights)
-  }
-
-  guard !headWeightsArrays.isEmpty else {
-    Log.model.warning("No valid attention weights extracted from alignment heads")
-    return []
-  }
-
-  // Ensure we have enough frames to process
-  // This can happen with very short final segments where numFrames/2 is too small
-  guard framesLen >= 2 else {
-    Log.model.warning("Frame count too small for alignment: \(framesLen) frames (need at least 2)")
-    return []
-  }
-
-  // Stack heads and slice to frame count: (heads, tokens, frames)
-  var weights = MLX.stacked(headWeightsArrays, axis: 0)
-  weights = weights[0..., 0..., 0 ..< framesLen]
-
-  // Ensure we have enough tokens for reduce operations (need > 1 for mean/variance along tokens axis)
-  guard weights.shape[1] >= 2 else {
-    Log.model.warning("Token count too small for alignment: \(weights.shape[1]) tokens (need at least 2)")
-    return []
-  }
-
-  // GPU preprocessing (matching Python exactly):
-  // weights = mx.softmax(weights * qk_scale, axis=-1, precise=True)
-  weights = MLX.softmax(weights * qkScale, axis: -1, precise: true)
-
-  // mean = mx.mean(weights, axis=-2, keepdims=True)
-  // std = mx.var(weights, axis=-2, keepdims=True, ddof=0).sqrt()
-  // weights = (weights - mean) / std
-  let mean = MLX.mean(weights, axis: -2, keepDims: true)
-  let variance = MLX.variance(weights, axis: -2, keepDims: true)
-  let std = MLX.sqrt(variance + 1e-8)
-  weights = (weights - mean) / std
-  weights = weights.asType(.float32)
-  eval(weights)
-
-  // Get actual dimensions
-  let actualTokensLen = weights.shape[1]
-  let actualFramesLen = weights.shape[2]
-  let numHeads = weights.shape[0]
-
-  // Convert to Swift array for median filter (CPU operation)
-  // Shape: (heads, tokens, frames) flattened
-  let weightsArray = weights.asArray(Float.self)
-
-  // Apply median filter (still CPU - scipy.signal.medfilt equivalent)
-  let filteredWeights = medianFilterAttention(
-    weightsArray,
-    heads: numHeads,
-    tokens: actualTokensLen,
-    frames: actualFramesLen,
-    filterWidth: medfiltWidth
+  let batch = findAlignment(
+    model: model,
+    tokenizer: tokenizer,
+    textTokens: [textTokens] as [[Int]],
+    mel: mel,
+    audioFeatures: audioFeatures,
+    numFrames: numFrames as Any,
+    language: language,
+    task: task,
+    medfiltWidth: medfiltWidth,
+    qkScale: qkScale
   )
-
-  // Average across heads using vDSP (CPU)
-  let matrixSize = actualTokensLen * actualFramesLen
-  var avgMatrix = [Float](repeating: 0, count: matrixSize)
-  let vLen = vDSP_Length(matrixSize)
-
-  // Sum all heads using vDSP_vadd
-  for h in 0 ..< numHeads {
-    filteredWeights.withUnsafeBufferPointer { ptr in
-      let headPtr = ptr.baseAddress! + h * matrixSize
-      vDSP_vadd(avgMatrix, 1, headPtr, 1, &avgMatrix, 1, vLen)
-    }
-  }
-
-  // Divide by number of heads
-  var invNumHeads = 1.0 / Float(numHeads)
-  vDSP_vsmul(avgMatrix, 1, &invNumHeads, &avgMatrix, 1, vLen)
-
-  // Extract the text portion for DTW: [no_timestamps, text_tokens] (excludes sot_sequence and eot)
-  // Python: matrix = matrix[len(tokenizer.sot_sequence) : -1]
-  // This includes no_timestamps at the start, matching Python's behavior exactly
-  let textMatrixStart = noTimestampsIndex * actualFramesLen
-  let textMatrixEnd = min((textStartIndex + textTokens.count) * actualFramesLen, avgMatrix.count)
-  guard textMatrixStart < textMatrixEnd else {
-    Log.model.warning("Invalid text matrix range")
-    return []
-  }
-
-  var textMatrix = Array(avgMatrix[textMatrixStart ..< textMatrixEnd])
-  let textMatrixRows = 1 + textTokens.count // no_timestamps + text_tokens (matches Python)
-  let textMatrixCols = actualFramesLen
-
-  // Run DTW on negative cost matrix (we want to maximize attention, so negate for min-cost DTW)
-  for i in 0 ..< textMatrix.count {
-    textMatrix[i] = -textMatrix[i]
-  }
-
-  let (textIndices, timeIndices) = textMatrix.withUnsafeBufferPointer { ptr in
-    dtw(ptr, rows: textMatrixRows, cols: textMatrixCols)
-  }
-
-  guard !textIndices.isEmpty else {
-    Log.model.warning("DTW returned empty alignment")
-    return []
-  }
-
-  // Split into words
-  let (words, wordTokenGroups) = tokenizer.splitToWordTokens(textTokens + [tokenizer.eot])
-
-  guard wordTokenGroups.count > 1 else {
-    // Only EOT marker or empty
-    return []
-  }
-
-  // Calculate word boundaries (cumulative token counts)
-  var wordBoundaries = [0]
-  var cumLen = 0
-  for group in wordTokenGroups.dropLast() {
-    cumLen += group.count
-    wordBoundaries.append(cumLen)
-  }
-
-  // Find jump points (where text index changes) - matches Python's approach
-  // Python: jumps = np.pad(np.diff(text_indices), (1, 0), constant_values=1).astype(bool)
-  // This creates a boolean mask with True at every position where text_index changes,
-  // plus a forced True at position 0.
-  var jumpPositions = [0] // Start with position 0 (forced like Python's padding)
-  for i in 1 ..< textIndices.count {
-    if textIndices[i] != textIndices[i - 1] {
-      jumpPositions.append(i)
-    }
-  }
-
-  // Convert jump positions to times
-  // Python: jump_times = time_indices[jumps] / TOKENS_PER_SECOND
-  let jumpTimes = jumpPositions.map { idx -> Float in
-    guard idx < timeIndices.count else { return 0 }
-    return Float(timeIndices[idx]) / tokensPerSecond
-  }
-
-  // Calculate word timings
-  // Python uses word_boundaries directly without offset:
-  //   start_times = jump_times[word_boundaries[:-1]]
-  //   end_times = jump_times[word_boundaries[1:]]
-  var wordTimings: [WordTiming] = []
-  for i in 0 ..< (words.count - 1) { // Skip EOT marker
-    let startBoundary = wordBoundaries[i]
-    let endBoundary = wordBoundaries[i + 1]
-
-    // Map boundaries to times
-    let startTime: Float
-    let endTime: Float
-
-    // Find the jump time for this boundary
-    if startBoundary < jumpTimes.count {
-      startTime = jumpTimes[startBoundary]
-    } else if !jumpTimes.isEmpty {
-      startTime = jumpTimes.last!
-    } else {
-      startTime = 0
-    }
-
-    if endBoundary < jumpTimes.count {
-      endTime = jumpTimes[endBoundary]
-    } else if !jumpTimes.isEmpty {
-      endTime = jumpTimes.last!
-    } else {
-      endTime = startTime
-    }
-
-    // Calculate average probability for word
-    // Use original word boundaries (without +1 offset) since textTokenProbs is indexed on text tokens
-    var avgProb: Float = 0
-    let probStart = wordBoundaries[i]
-    let probEnd = min(wordBoundaries[i + 1], textTokenProbs.count)
-    if probStart < probEnd {
-      for j in probStart ..< probEnd {
-        avgProb += textTokenProbs[j]
-      }
-      avgProb /= Float(probEnd - probStart)
-    }
-
-    wordTimings.append(WordTiming(
-      word: words[i],
-      tokens: wordTokenGroups[i],
-      start: startTime,
-      end: max(endTime, startTime), // Ensure end >= start
-      probability: avgProb
-    ))
-  }
-
-  return wordTimings
+  return batch.first ?? []
 }
 
 // MARK: - Batched Word Timestamps
@@ -841,10 +726,11 @@ func findAlignment(
 ///   - model: Whisper model with alignment heads
 ///   - tokenizer: Whisper tokenizer
 ///   - mel: Mel spectrogram for the current window
-///   - numFrames: Number of audio frames (segment_size)
+///   - numFrames: Number of audio frames (segment_size). Can be [Int] for variable batched.
 ///   - language: Language code
 ///   - task: Transcription task
-///   - timeOffset: Time offset for current window
+///   - timeOffset: Time offset for current window (used if timeOffsets is nil)
+///   - timeOffsets: Optional array of time offsets, one per segment (for VAD batched mode)
 ///   - lastSpeechTimestamp: End time of last speech (for segment boundary clipping)
 /// - Returns: Updated lastSpeechTimestamp
 func addWordTimestamps(
@@ -853,10 +739,11 @@ func addWordTimestamps(
   tokenizer: WhisperTokenizer,
   mel: MLXArray,
   audioFeatures: MLXArray? = nil,
-  numFrames: Int,
+  numFrames: Any, // Int or [Int]
   language: String?,
   task: TranscriptionTask,
   timeOffset: Float,
+  timeOffsets: [Float]? = nil,
   lastSpeechTimestamp: Float
 ) -> Float {
   guard !segments.isEmpty else { return lastSpeechTimestamp }
@@ -866,23 +753,49 @@ func addWordTimestamps(
     segment.tokens.filter { $0 < tokenizer.eot }
   }
 
-  // Concatenate all text tokens for batched alignment (Python: itertools.chain.from_iterable)
-  let allTextTokens = textTokensPerSegment.flatMap { $0 }
-
-  guard !allTextTokens.isEmpty else { return lastSpeechTimestamp }
-
-  // Single findAlignment call for ALL segments (key optimization).
-  // Pass pre-computed audioFeatures if available to skip the encoder re-run.
-  var alignment = findAlignment(
-    model: model,
-    tokenizer: tokenizer,
-    textTokens: allTextTokens,
-    mel: mel,
-    audioFeatures: audioFeatures,
-    numFrames: numFrames,
-    language: language,
-    task: task
-  )
+  guard !textTokensPerSegment.isEmpty else { return lastSpeechTimestamp }
+  
+  // Determine if we are in "Batched VAD Mode" (independent contexts) or "Shared Context Mode"
+  // VAD Mode: audioFeatures has batch dim matching segments count, and segments > 1
+  // Note: audioFeatures might be nil (if not passed), check segments count vs mel shape?
+  // Assume if timeOffsets is passed, it is Batched VAD Mode.
+  let isBatchedContext = timeOffsets != nil || ((audioFeatures?.shape[0] ?? 0) == segments.count && segments.count > 1)
+  
+  var alignment: [WordTiming] = []
+  
+  if isBatchedContext {
+      // Batched Mode: segments have independent audio contexts (e.g. from VAD)
+      // Pass tokens as batch [[Int]] to findAlignment
+      let batchAlignment = findAlignment(
+        model: model,
+        tokenizer: tokenizer,
+        textTokens: textTokensPerSegment,
+        mel: mel,
+        audioFeatures: audioFeatures,
+        numFrames: numFrames,
+        language: language,
+        task: task
+      )
+      // Flatten the results to a single sequence of words
+      alignment = batchAlignment.flatMap { $0 }
+  } else {
+      // Shared Context Mode: segments share the same audio context (e.g. sequential decoding)
+      // Concatenate all text tokens for single-sequence alignment (matching Python)
+      let allTextTokens = textTokensPerSegment.flatMap { $0 }
+      guard !allTextTokens.isEmpty else { return lastSpeechTimestamp }
+      
+      // Single findAlignment call for the concatenated sequence
+      alignment = findAlignment(
+        model: model,
+        tokenizer: tokenizer,
+        textTokens: allTextTokens, // [Int] -> wrapper calls findAlignment batch=1
+        mel: mel,
+        audioFeatures: audioFeatures,
+        numFrames: (numFrames as? Int) ?? (numFrames as? [Int])?.first ?? 3000,
+        language: language,
+        task: task
+      )
+  }
 
   guard !alignment.isEmpty else { return lastSpeechTimestamp }
 
@@ -900,10 +813,14 @@ func addWordTimestamps(
   // Distribute words back to segments (Python lines 265-329)
   var wordIndex = 0
   var updatedLastSpeechTimestamp = lastSpeechTimestamp
+  
+  // Use provided per-segment offsets or fallback to single global offset
+  let offsets = timeOffsets ?? Array(repeating: timeOffset, count: segments.count)
 
   for (segmentIdx, textTokens) in textTokensPerSegment.enumerated() {
     var savedTokens = 0
     var words: [Word] = []
+    let currentOffset = offsets[segmentIdx]
 
     // Consume words until we've covered this segment's tokens
     while wordIndex < alignment.count, savedTokens < textTokens.count {
@@ -912,8 +829,8 @@ func addWordTimestamps(
       if !timing.word.isEmpty {
         words.append(Word(
           word: timing.word,
-          start: TimeInterval(timeOffset + timing.start),
-          end: TimeInterval(timeOffset + timing.end),
+          start: TimeInterval(currentOffset + timing.start),
+          end: TimeInterval(currentOffset + timing.end),
           probability: timing.probability
         ))
       }
@@ -998,210 +915,4 @@ func addWordTimestamps(
   }
 
   return updatedLastSpeechTimestamp
-}
-
-// MARK: - Hallucination Detection
-
-/// Python's string.punctuation: !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
-/// Used to filter out single-character punctuation words in anomaly detection.
-private let pythonPunctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
-
-/// Calculate anomaly score for a word
-///
-/// Anomalous words are very long, very short, or have low probability.
-/// This matches Python's `word_anomaly_score()` function exactly.
-///
-/// - Parameter word: Word timing to score
-/// - Returns: Anomaly score (higher = more anomalous)
-func wordAnomalyScore(_ word: WordTiming) -> Float {
-  let duration = word.end - word.start
-  var score: Float = 0.0
-
-  // Low probability words are suspicious
-  if word.probability < 0.15 {
-    score += 1.0
-  }
-
-  // Very short words (< 133ms) are suspicious
-  if duration < 0.133 {
-    score += (0.133 - duration) * 15
-  }
-
-  // Very long words (> 2s) are suspicious
-  if duration > 2.0 {
-    score += duration - 2.0
-  }
-
-  return score
-}
-
-/// Check if a segment's words indicate a possible hallucination
-///
-/// A segment is considered anomalous if the first 8 non-punctuation words
-/// have a combined anomaly score >= 3, or if almost all words are anomalous.
-/// This matches Python's `is_segment_anomaly()` function exactly.
-///
-/// - Parameter words: Words from a segment
-/// - Returns: True if the segment appears to be a hallucination
-func isSegmentAnomaly(_ words: [WordTiming]?) -> Bool {
-  guard let words, !words.isEmpty else {
-    return false
-  }
-
-  // Filter out words that are entirely punctuation (matching Python's `w["word"] not in punctuation`)
-  // Python checks if the word string is a substring of string.punctuation
-  // This filters single-char punctuation like "." but keeps multi-char like "..."
-  let filteredWords = words.filter { word in
-    !pythonPunctuation.contains(word.word)
-  }.prefix(8)
-
-  guard !filteredWords.isEmpty else {
-    return false
-  }
-
-  let score = filteredWords.reduce(Float(0)) { $0 + wordAnomalyScore($1) }
-
-  // Anomalous if score >= 3 or if almost all words are anomalous
-  return score >= 3 || score + 0.01 >= Float(filteredWords.count)
-}
-
-/// Get the end time of the last word across segments
-///
-/// - Parameter segments: Array of transcription segments
-/// - Returns: End time of the last word, or nil if no words
-func getLastWordEnd(_ segments: [TranscriptionSegment]) -> Float? {
-  for segment in segments.reversed() {
-    if let words = segment.words, let lastWord = words.last {
-      return Float(lastWord.end)
-    }
-  }
-  // Fall back to segment end time
-  return segments.last.map { Float($0.end) }
-}
-
-/// Find the next segment that has words
-///
-/// - Parameters:
-///   - segments: Array of segments to search
-///   - startIndex: Index to start searching from
-/// - Returns: The next segment with words, or nil
-func nextWordsSegment(_ segments: [TranscriptionSegment], startIndex: Int) -> TranscriptionSegment? {
-  for i in startIndex ..< segments.count {
-    if let words = segments[i].words, !words.isEmpty {
-      return segments[i]
-    }
-  }
-  return nil
-}
-
-/// Filter out hallucinated segments based on anomaly detection
-///
-/// This implements hallucination detection matching Python's approach exactly.
-/// Segments that appear anomalous and are surrounded by silence are filtered out.
-///
-/// Python's logic (whisper.py lines 781-820):
-/// - Iterates through current_segments checking each for anomaly
-/// - Uses hal_last_end to track last speech end (initialized to last_speech_timestamp)
-/// - silence_before: gap from last speech > threshold OR near window start
-/// - silence_after: gap to next segment > threshold OR next is anomaly OR near window end
-/// - When both are true, segment is filtered as hallucination
-///
-/// - Parameters:
-///   - segments: Array of transcription segments with word timestamps
-///   - threshold: Silence threshold in seconds for hallucination detection
-///   - audioDuration: Total audio duration in seconds
-/// - Returns: Filtered array of segments with hallucinations removed
-func filterHallucinatedSegments(
-  _ segments: [TranscriptionSegment],
-  threshold: Float,
-  audioDuration: Float
-) -> [TranscriptionSegment] {
-  let chunkLength: Float = 30.0 // Whisper's 30-second chunk size
-
-  guard threshold > 0, !segments.isEmpty else {
-    return segments
-  }
-
-  var filteredSegments: [TranscriptionSegment] = []
-  var lastSpeechTimestamp: Float = 0
-
-  for (index, segment) in segments.enumerated() {
-    guard let words = segment.words, !words.isEmpty else {
-      // Keep segments without words (they won't affect hallucination detection)
-      filteredSegments.append(segment)
-      continue
-    }
-
-    let wordTimings = words.map { word in
-      WordTiming(
-        word: word.word,
-        tokens: [],
-        start: Float(word.start),
-        end: Float(word.end),
-        probability: word.probability
-      )
-    }
-
-    // Check if this segment is anomalous
-    if isSegmentAnomaly(wordTimings) {
-      let segmentStart = Float(segment.start)
-      let segmentEnd = Float(segment.end)
-
-      // Compute which 30s window this segment belongs to (for relative time calculations)
-      // Python uses time_offset and window_end_time within each processing window
-      let windowIdx = Int(segmentStart / chunkLength)
-      let timeOffset = Float(windowIdx) * chunkLength
-      let windowEndTime = min(Float(windowIdx + 1) * chunkLength, audioDuration)
-
-      // Find next segment with words
-      let nextSeg = nextWordsSegment(segments, startIndex: index + 1)
-      let halNextStart: Float = if let next = nextSeg, let nextWords = next.words, let firstWord = nextWords.first {
-        Float(firstWord.start)
-      } else {
-        // Python: hal_next_start = time_offset + segment_duration (i.e., window end)
-        timeOffset + chunkLength
-      }
-
-      // Check for silence before this segment (matching Python exactly)
-      // Python: segment["start"] - hal_last_end > threshold
-      //         or segment["start"] < threshold
-      //         or segment["start"] - time_offset < 2.0
-      let silenceBefore = (segmentStart - lastSpeechTimestamp > threshold) ||
-        (segmentStart < threshold) ||
-        (segmentStart - timeOffset < 2.0)
-
-      // Check for silence after this segment (matching Python exactly)
-      // Python: hal_next_start - segment["end"] > threshold
-      //         or is_segment_anomaly(next_segment)
-      //         or window_end_time - segment["end"] < 2.0
-      let nextWordTimings: [WordTiming]? = nextSeg?.words?.map { word in
-        WordTiming(
-          word: word.word,
-          tokens: [],
-          start: Float(word.start),
-          end: Float(word.end),
-          probability: word.probability
-        )
-      }
-      let silenceAfter = (halNextStart - segmentEnd > threshold) ||
-        isSegmentAnomaly(nextWordTimings) ||
-        (windowEndTime - segmentEnd < 2.0)
-
-      // If surrounded by silence, this is likely a hallucination - skip it
-      if silenceBefore, silenceAfter {
-        Log.model.debug("Filtering hallucinated segment: \"\(segment.text)\" (\(segmentStart)-\(segmentEnd)s)")
-        continue
-      }
-    }
-
-    // Keep this segment and update last speech timestamp
-    // Python: hal_last_end = segment["end"] (only for non-filtered segments)
-    filteredSegments.append(segment)
-
-    if let lastWord = words.last {
-      lastSpeechTimestamp = Float(lastWord.end)
-    }
-  }
-
-  return filteredSegments
 }

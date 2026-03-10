@@ -24,6 +24,48 @@ Python settings: `word_timestamps=True`, `condition_on_previous_text=False`.
 
 ---
 
+## Session 4: GPU-Accelerated Alignment & Batched Word Timestamps
+
+### Goal
+Optimize the word-level timestamp generation, which was identified as a bottleneck due to CPU-bound DTW preparation and sequential processing in the batched path.
+
+### Changes
+1.  **GPU Median Filter (`WhisperTiming.swift`)**: Implemented `medianFilterAttentionGPU` using MLX primitives (`concatenated`, `stacked`, `sorted`) to perform the 7-kernel median filter entirely on the GPU. This avoids transferring the massive [Batch, Heads, Tokens, Frames] attention tensor to the CPU.
+2.  **GPU Head Averaging**: Performed averaging across alignment heads on the GPU using `MLX.mean`.
+3.  **Batched `findAlignment`**: Refactored `findAlignment` to accept `textTokens: Any` ([Int] or [[Int]]) and `numFrames: Any` (Int or [Int]) to process a full batch of segments in parallel on the GPU for the heavy matrix operations (softmax, normalization, filtering, averaging).
+4.  **Batched `addWordTimestamps`**: Updated `addWordTimestamps` to handle batched inputs with `timeOffsets: [Float]?` parameter and call the batched `findAlignment`.
+5.  **Batched `transcribeBatched` Loop**: Refactored the main loop in `WhisperSTT.swift` to collect accepted segments and audio features, then call `addWordTimestamps` once per batch instead of per-segment.
+
+### Results (21-min AMI corpus, GPU contested)
+
+| Metric | Value |
+|--------|-------|
+| RTF | 0.1085 (not reliable — GPU contested) |
+| Word Jaccard | 0.740 |
+| Match Rate | 82.5% |
+| Start MAE | 91 ms (good) |
+| End MAE | 105 ms |
+
+Word timestamp quality is maintained. RTF measurement requires uncontested GPU.
+
+### Why Batched Alignment Isn't Dramatically Faster
+
+The optimizations target GPU operations, but the core bottleneck is CPU-bound:
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| Median filter | CPU, per-segment | GPU, batched |
+| Head averaging | CPU, per-segment | GPU, batched |
+| CPU→GPU transfer | ~100MB attention tensor | ~25MB averaged matrix |
+| Decoder passes | N separate | 1 batched |
+| **DTW** | **Sequential (CPU)** | **Sequential (CPU) — unchanged** |
+
+**The ceiling**: Dynamic Time Warping is a dynamic programming algorithm that cannot be parallelized on GPU. Each cell depends on its neighbors. If DTW takes 30% of alignment time, maximum theoretical speedup from GPU batching is ~1.4x.
+
+To achieve substantially faster word timestamps would require replacing DTW with a different algorithm (e.g., WhisperX's wav2vec2 forced aligner).
+
+---
+
 ## Session 1–2 Results (sequential decoder, no word timestamps)
 
 Audio: `ami_ES2002a_full.wav` (21 min), 3 runs each with warmup.
