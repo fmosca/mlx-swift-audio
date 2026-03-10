@@ -66,6 +66,75 @@ To achieve substantially faster word timestamps would require replacing DTW with
 
 ---
 
+## Session 5: Alternative Alignment Approaches Evaluation
+
+### Goal
+Evaluate alternative word alignment approaches to potentially replace DTW with something faster and/or more accurate.
+
+### Approaches Tested
+
+#### 1. Parakeet-TDT (FluidAudio, CoreML)
+
+Parakeet-TDT is a Token-and-Duration Transducer model that produces native token-level timestamps as part of decoding (no DTW needed). Tested via FluidAudio's `AsrManager`.
+
+**Results (21-min AMI corpus):**
+
+| Metric | Parakeet-TDT | Swift DTW | Python Whisper |
+|--------|--------------|-----------|----------------|
+| RTF | 0.011 (fastest) | 0.054 | 0.060 |
+| Word Jaccard | **0.114** (poor) | 0.740 | 1.0 (ref) |
+| Start MAE | **229 ms** (poor) | 91 ms | — |
+| Match rate | 47% | 82% | — |
+
+**Conclusion**: Parakeet is optimized for real-time streaming, not offline meeting transcription. Text quality is significantly worse than Whisper. **Not suitable** for our use case.
+
+#### 2. Qwen3-ForcedAligner (speech-swift, MLX)
+
+Qwen3-ForcedAligner is a dedicated forced alignment model (audio + text → timestamps) using a 5000-class timestamp classifier instead of DTW.
+
+**Results (5-min AMI corpus):**
+
+| Metric | Qwen3-ForcedAligner | Swift DTW |
+|--------|---------------------|-----------|
+| Whisper RTF | 0.042 | — |
+| Alignment RTF | 0.024 | — |
+| Total RTF | 0.066 | 0.054 |
+| Word Jaccard | — | 0.740 |
+| Start MAE | **285 ms** (poor) | 91 ms |
+| Match rate | 62% | 82% |
+
+**Conclusion**: Many aligned words have zero duration (`[5.52–5.52]`), indicating poor alignment quality. The model may be trained on different audio characteristics. **Not suitable** — worse than DTW in both speed and accuracy.
+
+#### 3. Qwen3-ASR (speech-swift, MLX)
+
+Examined for native timestamp capabilities.
+
+**Finding**: Qwen3-ASR is a standard autoregressive decoder with no native timestamp support. Would require DTW like Whisper. **Not applicable**.
+
+### Summary: Alternative Alignment Approaches
+
+| Approach | Total RTF | Start MAE | Quality | Verdict |
+|----------|-----------|-----------|---------|---------|
+| **Whisper + DTW** (current) | 0.054 | **91 ms** | Best | **Keep** |
+| Parakeet-TDT | 0.011 | 229 ms | Poor | Not suitable |
+| Qwen3-ForcedAligner | 0.066 | 285 ms | Poor | Not suitable |
+| Qwen3-ASR | — | — | — | No timestamps |
+
+### Recommended Path Forward: wav2vec2
+
+The gold standard for word alignment (used by WhisperX) is **wav2vec2 CTC forced alignment**:
+- Takes audio + text as input
+- Uses CTC to find optimal character-to-frame alignment
+- Achieves ~30-50ms MAE (vs 91ms DTW)
+
+Two implementation plans written:
+1. **CoreML Export** (`docs/WAV2VEC2_COREML_PLAN.md`) — 1-2 days effort
+2. **MLX Native Port** (`docs/WAV2VEC2_MLX_PLAN.md`) — 3-5 days effort
+
+Current DTW implementation (91ms MAE) is acceptable for production use. wav2vec2 is a future optimization opportunity.
+
+---
+
 ## Session 1–2 Results (sequential decoder, no word timestamps)
 
 Audio: `ami_ES2002a_full.wav` (21 min), 3 runs each with warmup.
