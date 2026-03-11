@@ -1,8 +1,9 @@
 import AVFoundation
-import FluidAudio
 import Foundation
+import FluidAudio
 import MLXAudio
 import Qwen3ASR
+import Wav2Vec2Aligner
 
 @main
 struct WhisperBenchmarkCLI {
@@ -58,6 +59,14 @@ struct WhisperBenchmarkCLI {
         let audioFile = args.count > 2 ? args[2] : "ami_ES2002a_5min.wav"
         let baselineFile = args.count > 3 ? args[3] : nil
         try await runQwen3AlignCompare(audioFile: audioFile, baselineFile: baselineFile)
+      case "wav2vec2-align":
+        let audioFile = args.count > 2 ? args[2] : "ami_ES2002a_5min.wav"
+        let baselineFile = args.count > 3 ? args[3] : nil
+        try await runWav2Vec2AlignCompare(audioFile: audioFile, baselineFile: baselineFile)
+      case "wav2vec2-align-full":
+        let audioFile = args.count > 2 ? args[2] : "ami_ES2002a_full.wav"
+        let baselineFile = args.count > 3 ? args[3] : nil
+        try await runWav2Vec2AlignCompare(audioFile: audioFile, baselineFile: baselineFile)
       default:
         printUsage()
       }
@@ -100,6 +109,12 @@ struct WhisperBenchmarkCLI {
                     Python Whisper baseline. Uses Whisper for transcription, then
                     Qwen3 for alignment. Expected to be faster and more accurate
                     than DTW-based approaches.
+      wav2vec2-align [audio] [baseline_json]
+                    Compare wav2vec2 CTC forced aligner (MLX-native) against Python
+                    Whisper baseline. Uses Whisper for transcription, then wav2vec2
+                    (MLX) for word-level alignment via CTC forced alignment.
+      wav2vec2-align-full [audio] [baseline_json]
+                    Same as wav2vec2-align using the full 21-min fixture.
     """)
   }
 
@@ -705,6 +720,232 @@ struct WhisperBenchmarkCLI {
     print("\n  First 10 aligned words:")
     for word in alignedWords.prefix(10) {
       print(String(format: "    [%.2f–%.2f] %@", word.startTime, word.endTime, word.text as NSString))
+    }
+  }
+
+  // MARK: - wav2vec2 CTC Forced Aligner comparison (MLX)
+
+  /// Compare wav2vec2 CTC forced aligner (MLX) against Python Whisper baseline.
+  /// Uses Whisper for transcription, then wav2vec2 for word-level alignment.
+  static func runWav2Vec2AlignCompare(audioFile: String, baselineFile: String?) async throws {
+    let audioURL = URL(fileURLWithPath: fixturesPath).appendingPathComponent(audioFile)
+    guard FileManager.default.fileExists(atPath: audioURL.path) else {
+      throw BenchmarkError.fixtureNotFound(audioURL.path)
+    }
+
+    let audioDuration = try getAudioDuration(audioURL)
+    print("\nAudio: \(audioFile)  [\(fmt1(audioDuration))s / \(String(format: "%.1f", audioDuration / 60)) min]")
+
+    // Locate baseline JSON
+    let stem = audioURL.deletingPathExtension().lastPathComponent
+    let baselineURL: URL
+    if let bf = baselineFile {
+      baselineURL = URL(fileURLWithPath: bf)
+    } else {
+      baselineURL = URL(fileURLWithPath: fixturesPath).appendingPathComponent("\(stem)_word_baseline.json")
+    }
+    guard FileManager.default.fileExists(atPath: baselineURL.path) else {
+      print("""
+        Baseline not found: \(baselineURL.path)
+
+        Generate it first:
+          python benchmarks/scripts/word_baseline.py \(audioURL.path)
+        """)
+      throw BenchmarkError.fixtureNotFound(baselineURL.path)
+    }
+
+    let pythonWords = try JSONDecoder().decode([PythonWord].self, from: Data(contentsOf: baselineURL))
+    print("Python baseline: \(pythonWords.count) words loaded from \(baselineURL.lastPathComponent)")
+
+    // Step 1: Transcribe with Whisper (batched, no word timestamps)
+    print("\n[Step 1] Transcribing with Whisper (batched)...")
+    let (whisperEngine, _, _) = try await loadEngine(audioFile: audioFile)
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let transcription = try await whisperEngine.transcribeBatched(
+      audioURL,
+      timestamps: .none,
+      batchSize: 4
+    )
+    let whisperTime = CFAbsoluteTimeGetCurrent() - t0
+    let whisperRTF = whisperTime / audioDuration
+    print("Whisper transcription: \(fmt1(whisperTime))s  RTF=\(fmt4(whisperRTF))")
+
+    // Extract text from segments (for reference only)
+    let whisperText = transcription.segments.map { $0.text.trimmingCharacters(in: CharacterSet.whitespaces) }.joined(separator: " ")
+    print("Swift Whisper text (\(whisperText.count) chars): \(whisperText.prefix(200))...")
+
+    // IMPORTANT: Use baseline transcript for fair comparison
+    // This ensures we're evaluating wav2vec2 alignment quality, not transcript differences
+    let baselineText = pythonWords.map { $0.word }.joined(separator: " ")
+    print("\nUsing Python baseline transcript (\(baselineText.count) chars) for alignment")
+    print("Baseline text: \(baselineText.prefix(200))...")
+
+    // Load audio for wav2vec2 (16kHz mono)
+    print("\nLoading audio for alignment...")
+    let samples16k = try load16kMono(url: audioURL, maxSeconds: nil)
+    print("Loaded \(samples16k.count) samples (\(fmt1(Double(samples16k.count) / 16000))s @ 16kHz)")
+
+    // Step 2: Run VAD to strip leading/trailing silence
+    print("\n[Step 2] Running Silero VAD to strip silence...")
+    // Use two-pass approach:
+    // 1. Strict parameters to find true first speech start (filters out leading noise)
+    // 2. Standard parameters to detect all speech segments
+    let strictVadConfig = VadSegmentationConfig(
+      minSpeechDuration: 0.5,   // Filter out brief noises at start
+      minSilenceDuration: 0.5,
+      maxSpeechDuration: 600.0,
+      speechPadding: 0.1
+    )
+    let standardVadConfig = VadSegmentationConfig(
+      minSpeechDuration: 0.15,
+      minSilenceDuration: 0.5,
+      maxSpeechDuration: 600.0,
+      speechPadding: 0.1
+    )
+    let vad = try await VadManager(config: VadConfig(computeUnits: .cpuAndNeuralEngine))
+
+    // Get strict segments for accurate first speech detection
+    let strictSegments = try await vad.segmentSpeech(samples16k, config: strictVadConfig)
+    // Get standard segments for complete speech coverage
+    let vadSegments = try await vad.segmentSpeech(samples16k, config: standardVadConfig)
+
+    guard !vadSegments.isEmpty else {
+      print("ERROR: No speech segments detected by VAD")
+      throw BenchmarkError.fixtureNotFound("No speech detected in audio")
+    }
+
+    // Use strict segments to find true first speech start, but standard segments for coverage
+    let firstSpeechStart = strictSegments.isEmpty ? vadSegments.first!.startTime : strictSegments.first!.startTime
+    let lastSpeechEnd = vadSegments.last!.endTime
+    let originalDuration = Double(samples16k.count) / 16000.0
+    let trimmedDuration = lastSpeechEnd - firstSpeechStart
+    let leadingSilence = firstSpeechStart
+    let trailingSilence = originalDuration - lastSpeechEnd
+
+    print("VAD detected \(vadSegments.count) speech segments (standard)")
+    if !strictSegments.isEmpty {
+      print("VAD detected \(strictSegments.count) speech segments (strict)")
+    }
+    print(String(format: "  First speech (strict): %.2fs  Last speech ends: %.2fs", firstSpeechStart, lastSpeechEnd))
+    print(String(format: "  Leading silence: %.2fs  Trailing silence: %.2fs", leadingSilence, trailingSilence))
+    print(String(format: "  Trimmed audio: %.2fs → %.2fs (%.1f%% reduction)",
+      originalDuration, trimmedDuration,
+      (1.0 - trimmedDuration / originalDuration) * 100))
+
+    // Trim audio to speech region only
+    let startSample = Int(firstSpeechStart * 16000)
+    let endSample = Int(lastSpeechEnd * 16000)
+    let trimmedAudio = Array(samples16k[startSample..<endSample])
+    print("Trimmed to \(trimmedAudio.count) samples (\(fmt1(Double(trimmedAudio.count) / 16000))s @ 16kHz)")
+
+    // Step 3: Align with wav2vec2 MLX using BASELINE transcript
+    print("\n[Step 3] Aligning with wav2vec2 CTC forced aligner (MLX)...")
+    print("[Step 3] Loading Wav2Vec2AlignerMLX from Hugging Face...")
+
+    let aligner = try await Wav2Vec2AlignerMLX.fromPretrained(
+      modelId: "facebook/wav2vec2-base-960h"
+    ) { progress in
+      if progress.fractionCompleted < 1.0 {
+        print("  [\(Int(progress.fractionCompleted * 100))%] Downloading \(progress.localizedDescription ?? "")")
+      }
+    }
+    print("Model loaded successfully")
+
+    let t1 = CFAbsoluteTimeGetCurrent()
+    let alignedWords = try aligner.align(
+      audio: trimmedAudio,
+      text: baselineText  // Use baseline transcript, not Swift Whisper
+    )
+    let alignTime = CFAbsoluteTimeGetCurrent() - t1
+
+    // Adjust timestamps back by adding the original offset (leading silence)
+    let offset = Float(firstSpeechStart)
+    let adjustedWords = alignedWords.map { word -> WordAlignment in
+      WordAlignment(
+        word: word.word,
+        startTime: word.startTime + offset,
+        endTime: word.endTime + offset
+      )
+    }
+    let alignRTF = alignTime / audioDuration
+    print("wav2vec2 alignment: \(fmt1(alignTime))s  RTF=\(fmt4(alignRTF))")
+    print("Aligned \(adjustedWords.count) words (timestamps adjusted for VAD trim)")
+
+    // Total time (Whisper + wav2vec2)
+    let totalTime = whisperTime + alignTime
+    let totalRTF = totalTime / audioDuration
+
+    // ── Timing accuracy: one-to-one greedy matching ──
+    struct Wav2Vec2Entry { var start, end: Float; var used: Bool }
+    var wav2vec2Index: [String: [Wav2Vec2Entry]] = [:]
+    for w in adjustedWords {
+      let key = w.word.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters)
+      wav2vec2Index[key, default: []].append(Wav2Vec2Entry(start: w.startTime, end: w.endTime, used: false))
+    }
+
+    var signedStartErrors: [Double] = []
+    var absEndErrors: [Double] = []
+
+    for pw in pythonWords {
+      let key = pw.word.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters)
+      guard var candidates = wav2vec2Index[key] else { continue }
+      var bestIdx: Int? = nil
+      var bestDist = 1.5  // Max time difference to match (seconds)
+
+      for (i, c) in candidates.enumerated() {
+        let dist = max(abs(Double(c.start) - pw.start), abs(Double(c.end) - pw.end))
+        if dist < bestDist {
+          bestDist = dist
+          bestIdx = i
+        }
+      }
+
+      guard let idx = bestIdx else { continue }
+      candidates[idx].used = true
+      wav2vec2Index[key] = candidates
+      signedStartErrors.append(Double(candidates[idx].start) - pw.start)
+      absEndErrors.append(abs(Double(candidates[idx].end) - pw.end))
+    }
+
+    let matchRate = pythonWords.isEmpty ? 0.0 : Double(signedStartErrors.count) / Double(pythonWords.count)
+    let startMAE = signedStartErrors.isEmpty ? 0.0 : signedStartErrors.map(abs).reduce(0, +) / Double(signedStartErrors.count)
+    let endMAE = absEndErrors.isEmpty ? 0.0 : absEndErrors.reduce(0, +) / Double(absEndErrors.count)
+    let startBias = signedStartErrors.isEmpty ? 0.0 : signedStartErrors.reduce(0, +) / Double(signedStartErrors.count)
+    let sortedAbsStart = signedStartErrors.map(abs).sorted()
+    let startP90 = sortedAbsStart.isEmpty ? 0.0 : sortedAbsStart[Int(Double(sortedAbsStart.count) * 0.9)]
+
+    // ── Report ──────────────────────────────────────────────────────────────
+    let sep = String(repeating: "=", count: 70)
+    print("\n\(sep)")
+    print("WAV2VEC2-MLX vs PYTHON WHISPER  [\(audioFile)]")
+    print(sep)
+    print("  Timing breakdown")
+    print(String(format: "    Whisper ASR:    %.1fs  RTF=%.4f", whisperTime, whisperRTF))
+    print(String(format: "    wav2vec2 align: %.1fs  RTF=%.4f", alignTime, alignRTF))
+    print(String(format: "    TOTAL:          %.1fs  RTF=%.4f", totalTime, totalRTF))
+    print("")
+    print("  Word counts")
+    print(String(format: "    Python baseline: %ld", pythonWords.count))
+    print(String(format: "    wav2vec2 aligned: %ld", adjustedWords.count))
+    print("")
+    print("  Timing accuracy  (\(signedStartErrors.count) matched pairs, ±1.5 s window)")
+    print(String(format: "    Match rate:     %.1f%%", matchRate * 100))
+    print(String(format: "    Start MAE:      %.3f s  (%.0f ms)", startMAE, startMAE * 1000))
+    print(String(format: "    End MAE:        %.3f s  (%.0f ms)", endMAE, endMAE * 1000))
+    print(String(format: "    Start p90 err:  %.3f s", startP90))
+    print(String(format: "    Start bias:     %+.3f s", startBias))
+
+    let timingGrade: String
+    if startMAE < 0.05 { timingGrade = "excellent (< 50 ms)" }
+    else if startMAE < 0.10 { timingGrade = "good (< 100 ms)" }
+    else if startMAE < 0.20 { timingGrade = "acceptable (< 200 ms)" }
+    else { timingGrade = "poor (> 200 ms)" }
+    print("    Assessment:     \(timingGrade)")
+
+    // Sample output
+    print("\n  First 10 aligned words:")
+    for word in adjustedWords.prefix(10) {
+      print(String(format: "    [%.2f–%.2f] %@", word.startTime, word.endTime, word.word as NSString))
     }
   }
 

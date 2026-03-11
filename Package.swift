@@ -15,10 +15,20 @@ let package = Package(
       name: "Kokoro",
       targets: ["Kokoro"],
     ),
+    // wav2vec2 forced aligner (CoreML, ANE-accelerated) for word-level timestamps
+    .library(
+      name: "Wav2Vec2Aligner",
+      targets: ["Wav2Vec2Aligner"],
+    ),
     // Benchmark CLI for performance testing
     .executable(
       name: "WhisperBenchmark",
       targets: ["WhisperBenchmark"],
+    ),
+    // Test executable for Wav2Vec2 weight loading
+    .executable(
+      name: "Wav2Vec2WeightTest",
+      targets: ["Wav2Vec2WeightTest"],
     ),
   ],
   dependencies: [
@@ -47,7 +57,7 @@ let package = Package(
         .product(name: "FluidAudio", package: "FluidAudio"),
       ],
       path: "package",
-      exclude: ["TTS/Kokoro", "Tests"],
+      exclude: ["TTS/Kokoro", "Wav2Vec2Aligner", "Tests"],
       resources: [
         .process("TTS/OuteTTS/default_speaker.json"), // Default speaker profile for OuteTTS
       ],
@@ -61,18 +71,37 @@ let package = Package(
       ],
       path: "package/TTS/Kokoro",
     ),
+    .target(
+      name: "Wav2Vec2Aligner",
+      dependencies: [
+        "MLXAudio",
+        .product(name: "MLX", package: "mlx-swift"),
+        .product(name: "MLXNN", package: "mlx-swift"),
+      ],
+      path: "package/Wav2Vec2Aligner",
+    ),
     .testTarget(
       name: "MLXAudioTests",
-      dependencies: ["MLXAudio"],
+      dependencies: ["MLXAudio", "Wav2Vec2Aligner"],
       path: "package/Tests",
     ),
     .executableTarget(
       name: "WhisperBenchmark",
       dependencies: [
         "MLXAudio",
+        "Wav2Vec2Aligner",
         .product(name: "Qwen3ASR", package: "speech-swift"),
       ],
       path: "benchmarks/cli",
+    ),
+    .executableTarget(
+      name: "Wav2Vec2WeightTest",
+      dependencies: [
+        "MLXAudio",
+        .product(name: "Transformers", package: "swift-transformers"),
+      ],
+      path: "scripts",
+      sources: ["verify_wav2vec2_weights.swift"],
     ),
   ],
 )

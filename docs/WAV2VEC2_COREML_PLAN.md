@@ -644,3 +644,59 @@ mlx-swift-audio/
 2. **Speed**: Alignment RTF < 0.02 (vs 0.024 current)
 3. **Reliability**: > 85% word match rate
 4. **Integration**: Clean API matching current `addWordTimestamps` signature
+
+---
+
+## Implementation Status (March 2026)
+
+### Completed ✅
+- Model conversion scripts (`scripts/convert_wav2vec2_coreml.py`, `export_wav2vec2_onnx.py`, `validate_wav2vec2_coreml.py`)
+- Swift implementation (`package/Wav2Vec2Aligner/`):
+  - `Wav2Vec2Model.swift` - CoreML wrapper
+  - `CTCForcedAlign.swift` - CTC alignment algorithm
+  - `Wav2Vec2Tokenizer.swift` - Character tokenization
+  - `Wav2Vec2Aligner.swift` - High-level API
+- `Wav2Vec2AlignerTests.swift` - Unit tests (all pass)
+- Critical bug fix: MLMultiArray stride-based indexing in logSoftmax
+
+### Blocked ❌
+
+#### Issue 1: Metal Context Segfault
+- **Segfault (exit 139)** during static initialization when importing Wav2Vec2Aligner
+- Crash occurs before main() executes, during module load phase
+- Unit tests work via xcodebuild, but standalone benchmark executable crashes
+- Root cause: CoreML and MLX Metal context conflict during static initialization
+
+#### Issue 2: CoreML Model Numerical Corruption (March 11, 2026)
+- **ONNX → PyTorch validation**: ✅ PASSED (max diff: 0.000042)
+- **CoreML model validation**: ❌ FAILED (numerical corruption)
+
+**CoreML vs PyTorch output comparison (1 second test audio):**
+
+| Metric | CoreML | PyTorch (Reference) | Error Factor |
+|--------|--------|-------------------|--------------|
+| Shape | [1, 49, 32] | [1, 49, 32] | ✅ Correct |
+| Min | -42,012,168 | -16.71 | 2.5M× wrong |
+| Max | 0.000043 | 4.03 | Completely wrong |
+| Mean | -2,587,863 | -2.62 | 1M× wrong |
+| Std | 10,023,029 | 4.69 | 2M× wrong |
+
+**Root cause**: ONNX → CoreML conversion produces numerically incorrect outputs. Possible causes:
+- coremltools version incompatibility (tested with Python 3.14 + coremltools 8.3.0)
+- Model operations not correctly translated to CoreML
+- Conversion settings or quantization issues
+
+**Impact**: Subprocess CoreML workaround (to avoid Metal conflict) is not viable because the CoreML model itself produces incorrect results.
+
+### Next Options
+1. **Accept DTW**: Use DTW for alignment (91ms MAE meets < 100ms target) ✅ **RECOMMENDED**
+2. **Fix CoreML conversion**: Requires debugging coremltools, may need older Python/coremltools version
+3. **Debug MLX model**: Continue numerical debugging of MLX port (see `WAV2VEC2_MLX_PLAN.md`)
+4. **Hybrid approach**: Whisper timestamps + DTW refinement (already working well)
+
+---
+
+## Test Scripts Added
+
+- `scripts/test_coreml_model.swift` - Swift validation script for CoreML model
+- `scripts/validate_wav2vec2_coreml.py` - Python validation script (requires working coremltools)

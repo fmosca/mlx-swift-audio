@@ -120,18 +120,173 @@ Examined for native timestamp capabilities.
 | Qwen3-ForcedAligner | 0.066 | 285 ms | Poor | Not suitable |
 | Qwen3-ASR | — | — | — | No timestamps |
 
-### Recommended Path Forward: wav2vec2
+### Session 6: wav2vec2 CoreML Implementation (March 2026)
 
-The gold standard for word alignment (used by WhisperX) is **wav2vec2 CTC forced alignment**:
-- Takes audio + text as input
-- Uses CTC to find optimal character-to-frame alignment
-- Achieves ~30-50ms MAE (vs 91ms DTW)
+Implemented wav2vec2 CTC forced aligner using CoreML. Model conversion scripts created
+(`scripts/convert_wav2vec2_coreml.py`, `export_wav2vec2_onnx.py`, `validate_wav2vec2_coreml.py`).
+Swift implementation complete in `package/Wav2Vec2Aligner/`.
 
-Two implementation plans written:
-1. **CoreML Export** (`docs/WAV2VEC2_COREML_PLAN.md`) — 1-2 days effort
-2. **MLX Native Port** (`docs/WAV2VEC2_MLX_PLAN.md`) — 3-5 days effort
+**Critical Bug Fixed:** MLMultiArray stride handling in `Wav2Vec2Model.swift`
+- CoreML outputs non-contiguous arrays with strides like [47968, 32, 1]
+- Original code attempted contiguous memory copy → segfault at element 24576
+- Fixed: Direct stride-based indexing in logSoftmax function
 
-Current DTW implementation (91ms MAE) is acceptable for production use. wav2vec2 is a future optimization opportunity.
+**Current Status:**
+- ✅ Unit tests pass (model load, short audio alignment, text alignment)
+- ✅ Model converted: `models/wav2vec2/Wav2Vec2CTC.mlpackage`
+- ❌ Benchmark crashes with segfault (exit 139) during static initialization
+- ✅ Quick benchmark mode works (no Wav2Vec2Aligner import)
+- ❌ wav2vec2-align mode crashes before main() executes
+
+**Issue:** Segfault occurs during module import phase, likely in CoreML initialization.
+VAD system prints "initialized in 0.04s" then crash before any debug prints appear.
+Unit tests work via xcodebuild but standalone executable crashes.
+
+**Next Steps:** Debug static initialization crash or fall back to MLX-native port.
+
+---
+
+### Session 7: wav2vec2 MLX Native Port (March 2026)
+
+Implemented MLX-native wav2vec2 forced aligner, abandoning CoreML approach due to
+static initialization crashes causing segfaults when CoreML and MLX Metal contexts
+conflict.
+
+**Files Created:**
+- `package/STT/Wav2Vec2/Wav2Vec2Config.swift` - Model configuration with presets
+- `package/STT/Wav2Vec2/Wav2Vec2FeatureExtractor.swift` - 7-layer Conv1d frontend
+- `package/STT/Wav2Vec2/Wav2Vec2Encoder.swift` - Transformer encoder with post-norm
+- `package/STT/Wav2Vec2/Wav2Vec2ForCTC.swift` - Full model with CTC head
+- `package/STT/Wav2Vec2/Wav2Vec2WeightLoader.swift` - HuggingFace weight loading
+- `package/Wav2Vec2Aligner/Wav2Vec2AlignerMLX.swift` - Drop-in replacement for CoreML version
+- `package/Tests/Wav2Vec2MLXTests.swift` - 16 focused unit tests
+- `package/Tests/Wav2Vec2WeightLoadingTests.swift` - Fast integration tests
+
+**Key Design Decisions:**
+- Used LayerNorm instead of GroupNorm for layer 0 (MLX compatibility)
+- Output format: [batch, frames, channels] throughout pipeline
+- Reused CTCForcedAligner and Wav2Vec2Tokenizer from CoreML version
+
+**Systematic Weight Loading Approach:**
+
+After iterative casings issues, completely redesigned weight loading with a clear
+canonical representation strategy:
+
+1. **ALL @ModuleInfo keys use snake_case** to match HuggingFace exactly
+2. **Only module names get camelCase** (e.g., feature_extractor → featureExtractor)
+3. **Minimal transformations**: Remove "wav2vec2." prefix, move feature_projection into encoder
+4. **Clear documentation**: Strategy explained in code comments for future maintainers
+
+```swift
+/// Transformation strategy (MINIMAL):
+/// 1. Remove "wav2vec2." prefix
+/// 2. Move feature_projection into encoder (HF has it at top level, our model nests it)
+/// 3. Convert "feature_extractor." to "featureExtractor." (ONLY module name conversion)
+/// 4. Keep ALL else as snake_case (matching HuggingFace)
+/// 5. Transpose conv weights for MLX format where needed
+///
+/// ALL @ModuleInfo keys MUST use snake_case to match HuggingFace format exactly.
+```
+
+**Lesson Learned:** Fast integration tests (`Wav2Vec2WeightLoadingTests.swift`) are essential
+for catching weight loading issues early. Tests run in ~30 seconds vs multi-minute benchmarks.
+
+**Critical CTC Alignment Bug Fixed:**
+
+The CTC forced alignment had a bug in `convertPathToAlignments` where blank frames
+didn't close token spans, causing tokens to extend across entire blank regions.
+
+**Before fix:** Token "already" had duration 4.5 seconds
+**After fix:** Token duration ~0.3 seconds (realistic)
+
+The fix tracks `lastNonBlankFrame` and closes tokens immediately on blank frames:
+```swift
+} else if currentToken != nil {
+  // Blank after a token - close the token span
+  let tokenString = idToToken[currentToken!] ?? ""
+  alignedTokens.append(AlignedToken(
+    token: tokenString,
+    tokenId: currentToken!,
+    startFrame: startFrame,
+    endFrame: lastNonBlankFrame  // Use last frame where token actually appeared
+  ))
+  currentToken = nil
+}
+```
+
+**Current Results (ami_ES2002a_5min.wav, 5 minutes):**
+
+| Metric | Target | Current | Status |
+|--------|--------|---------|--------|
+| Model loads | ✅ | ✅ | Pass |
+| Benchmark completes | ✅ | ✅ | Pass |
+| Start MAE | < 100ms | **466ms** | ❌ 4.7x target |
+| Alignment RTF | < 0.02 | 0.04 | ⚠️ 2x target |
+| Word match rate | > 80% | **44%** | ❌ 55% gap |
+
+**Root Causes Identified:**
+
+1. **Leading silence causes spurious detection** — Model detects tokens in silence where
+   no speech exists. First word "You've" detected at 0.26s vs baseline 4.86s (4.6s early).
+
+2. **Cumulative timing drift** — After first word, offsets range -0.74s to +0.60s,
+   suggesting small per-frame errors accumulate.
+
+3. **No VAD/silence stripping** — Aligner processes entire audio including silence.
+   wav2vec2 produces spurious detections in silent regions.
+
+**Next Steps:**
+1. Priority 1: Add VAD/silence handling to strip leading/trailing silence
+2. Priority 2: Verify model numerical accuracy against PyTorch reference
+3. Priority 3: Consider hybrid approach using Whisper timestamps as constraints
+
+**Files Updated:**
+- `docs/WAV2VEC2_MLX_PLAN.md` — Comprehensive implementation status and next steps
+
+---
+
+### Session 8: CoreML Model Validation (March 11, 2026)
+
+Investigated whether subprocess CoreML wav2vec2 could work around the Metal context
+conflict issue (Session 6). Required validating that the CoreML model produces
+numerically correct outputs.
+
+**Validation Approach:**
+1. **ONNX → PyTorch**: Validated ONNX model against PyTorch reference
+2. **CoreML → PyTorch**: Validated CoreML model against PyTorch reference
+
+**Results:**
+
+| Validation | Status | Max Difference |
+|------------|--------|----------------|
+| ONNX vs PyTorch | ✅ PASSED | 0.000042 |
+| CoreML vs PyTorch | ❌ FAILED | 42,012,168 |
+
+**CoreML numerical corruption details:**
+
+| Metric | CoreML | PyTorch (Reference) | Error Factor |
+|--------|--------|-------------------|--------------|
+| Shape | [1, 49, 32] | [1, 49, 32] | ✅ Correct |
+| Min | -42,012,168 | -16.71 | 2.5M× wrong |
+| Max | 0.000043 | 4.03 | Completely wrong |
+| Mean | -2,587,863 | -2.62 | 1M× wrong |
+| Std | 10,023,029 | 4.69 | 2M× wrong |
+
+**Root Cause:**
+- ONNX → PyTorch conversion is accurate
+- ONNX → CoreML conversion introduces severe numerical corruption
+- Possible causes: coremltools version incompatibility (Python 3.14 + coremltools 8.3.0),
+  unsupported operations, or conversion settings
+
+**Impact:**
+- Subprocess CoreML workaround is not viable — the model itself produces incorrect outputs
+- Cannot use CoreML wav2vec2 for alignment despite ONNX being correct
+
+**Conclusion:**
+DTW remains the recommended alignment solution (91ms MAE, ~95% match rate).
+
+**Files Created:**
+- `scripts/test_coreml_model.swift` — Swift CoreML validation script
 
 ---
 
@@ -451,6 +606,7 @@ under ideal conditions.
 - `compare` / `compare-full` — sequential vs batched side-by-side
 - `word-compare` — batched with word timestamps vs Python baseline
 - `vad-scan [dir] [maxFiles]` — VAD parameter validation on real recordings
+- `wav2vec2-align` — wav2vec2 forced alignment with VAD preprocessing
 
 ### Build command
 
@@ -465,3 +621,85 @@ xcodebuild -scheme WhisperBenchmark -configuration Release \
 The Metal default library (`default.metallib`) is not embedded in the executable when building
 through SPM's CLI tools. Runtime error: `MLX error: Failed to load the default metallib. library
 not found`. Xcode (`xcodebuild`) correctly embeds the Metal library.
+
+---
+
+## Session 6: wav2vec2 Numerical Verification
+
+### Goal
+
+Investigate why wav2vec2 MLX model produces poor alignment quality (460ms MAE, 56% match rate).
+
+### Method
+
+Created comprehensive numerical comparison test (`Wav2Vec2NumericalTests.swift`) comparing MLX Swift outputs to PyTorch reference on identical test audio (440Hz sine wave, 1 second @ 16kHz).
+
+Python script (`verify_wav2vec2_numerical.py`) generates PyTorch baseline outputs:
+- Feature extractor intermediate outputs
+- Positional embedding outputs
+- Encoder layer outputs
+- Final logits and log probabilities
+- Key model weights
+
+### Results — Critical Bug Found
+
+**Feature extractor produces opposite-sign outputs:**
+
+```
+MLX:    [-0.032, -0.035, -0.031, -0.033, -0.033, ...]
+PyTorch: [ 0.011,  0.020,  0.011,  0.010,  0.010, ...]
+⚠️ OPPOSITE SIGNS!
+```
+
+**Error compounds through network:**
+
+| Stage | Max Difference |
+|-------|----------------|
+| Feature extractor | 0.115 |
+| Encoder layer 0 | 1.71 |
+| Logits | 12.7 |
+| Log probs | 17.8 |
+
+**Blank token logits 2x higher in MLX:**
+- MLX mean: 9.81
+- PyTorch mean: 4.52
+
+This explains why characters only get 1 frame each — the model outputs are fundamentally wrong.
+
+### Root Cause
+
+The feature extractor produces outputs with opposite signs to PyTorch. Likely causes:
+1. Conv1d weight transpose direction
+2. GELU activation implementation
+3. LayerNorm implementation
+4. Feature projection (LayerNorm + Linear)
+
+### Alternative: TrellisForcedAligner
+
+Implemented WhisperX-style trellis CTC alignment (`TrellisForcedAlign.swift`) as an alternative:
+- Token-only trellis (no blank states)
+- Blank = "stay" on current token (not close it)
+- Produces continuous coverage even with peaky predictions
+- More robust to the current model output issues
+
+**Key difference from blank-interleaved CTC:**
+
+| Aspect | Current (Blank-interleaved) | WhisperX-style |
+|--------|-----------------------------|----------------|
+| States | [_, t1, _, t2, _] | [t1, t2] |
+| Blank | Close token | Stay on token |
+| Coverage | Gaps possible | Continuous |
+
+### Files Created/Updated
+
+- `scripts/verify_wav2vec2_numerical.py` — PyTorch baseline generator
+- `package/Tests/Wav2Vec2NumericalTests.swift` — Numerical comparison tests
+- `package/Wav2Vec2Aligner/TrellisForcedAlign.swift` — Alternative alignment algorithm
+- `package/STT/Wav2Vec2/Wav2Vec2Encoder.swift` — Made posConvEmbed/internal for testing
+- `docs/WAV2VEC2_MLX_PLAN.md` — Updated with findings and next steps
+
+### Next Steps
+
+1. **Priority 1:** Fix feature extractor sign bug
+2. **Priority 2:** Test TrellisForcedAligner as alternative
+3. **Fallback:** Keep DTW (91ms MAE is acceptable)
